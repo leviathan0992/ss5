@@ -1,0 +1,10 @@
+[Unit]
+Description=SS5-Client
+
+[Service]
+TimeoutStartSec=0
+ExecStart=/usr/local/bin/ss5-client -c /root/proxy/.ss5-client.json
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
