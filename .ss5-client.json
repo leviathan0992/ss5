@@ -1,0 +1,9 @@
+{
+  "server_addr": [
+    "127.0.0.1:58",
+    "127.0.0.1:53"
+  ],
+  "listen_addr": "127.0.0.1:2024",
+  "client_pem": "/etc/client.pem",
+  "client_key": "/etc/client.key"
+}
