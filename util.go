@@ -10,9 +10,11 @@ import (
 	"sync"
 )
 
-const ConnectionBuffer = 1024 * 1024 * 2 /* Buffer used after successful authentication in the connection 2M */
+/* The buffer (2M) is used after successful authentication between the connections. */
+const ConnectionBuffer = 1024 * 1024 * 2
 
-const Socks5Buffer = 256 * 1024 /* Buffer used for parsing SOCKS5 - 256 KB. */
+/* The buffer (256 KB) is used for parsing SOCKS5. */
+const Socks5Buffer = 256 * 1024
 
 var bytePool = sync.Pool{
 	New: func() interface{} {
@@ -36,8 +38,10 @@ func (s *Service) TLSWrite(conn net.Conn, buf []byte) error {
 		if err != nil {
 			return err
 		}
+
 		nWrite += n
 	}
+
 	return nil
 }
 
@@ -87,25 +91,25 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 
 	nRead, errRead := cliConn.Read(buf)
 	if errRead != nil {
-		return &net.TCPAddr{}, errors.New("failed to read SOCKS5 during the initial handshake phase")
+		return &net.TCPAddr{}, errors.New("the service failed to read SOCKS5 during the initial handshake phase")
 	}
 
 	if nRead > 0 {
 		if buf[0] != 0x05 {
-			/* The version of the protocol */
+			/* The version of the protocol. */
 			return &net.TCPAddr{}, errors.New("currently only supporting SOCKS5 protocol")
 		} else {
 			/* [SOCKS5, NO AUTHENTICATION REQUIRED]  */
 			errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00})
 			if errWrite != nil {
-				return &net.TCPAddr{}, errors.New("failed to respond to the client during the SOCKS5 initial handshake phase")
+				return &net.TCPAddr{}, errors.New("the service failed to respond to the client during the SOCKS5 initial handshake phase")
 			}
 		}
 	}
 
 	nRead, errRead = cliConn.Read(buf)
 	if errRead != nil {
-		return &net.TCPAddr{}, errors.New("failed to read SOCKS5 during the second handshake phase")
+		return &net.TCPAddr{}, errors.New("the service failed to read SOCKS5 during the second handshake phase")
 	}
 
 	if nRead > 0 {
@@ -117,10 +121,11 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 		switch buf[3] { /* Checking the address field. */
 		case 0x01: /* The version-4 IP address. */
 			dstIP = buf[4 : 4+net.IPv4len]
+
 		case 0x03: /* The fully-qualified domain name. */
 			ipAddr, err := net.ResolveIPAddr("ip", string(buf[5:nRead-2]))
 			if err != nil {
-				return &net.TCPAddr{}, errors.New("failed to parse the domain name")
+				return &net.TCPAddr{}, errors.New("the service failed to parse the domain name")
 			}
 			dstIP = ipAddr.IP
 		case 0x04: /* The version-6 IP address. */
@@ -128,29 +133,31 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 		default:
 			return &net.TCPAddr{}, errors.New("the received address field is incorrect")
 		}
+
 		dstPort := buf[nRead-2 : nRead]
 
 		if buf[1] == 0x01 {
-			/* TCP over SOCKS5 */
+			/* The TCP over SOCKS5. */
 			dstAddr := &net.TCPAddr{
 				IP:   dstIP,
 				Port: int(binary.BigEndian.Uint16(dstPort)),
 			}
+
 			return dstAddr, errRead
 		}
 	}
 
-	return &net.TCPAddr{}, errors.New("failed to parse SOCKS5 protocol")
+	return &net.TCPAddr{}, errors.New("the service failed to parse the SOCKS5 protocol")
 }
 
 func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 	srvConn, err := tls.Dial("tcp", s.StableServer.String(), conf)
 	if err != nil {
-		log.Printf("Failed to connect to the server %s failed: %s", s.StableServer.String(), err)
+		log.Printf("The service failed to connect to the server %s failed: %s.", s.StableServer.String(), err)
 
 		/* Attempting to connect to another server. */
 		for _, srv := range s.ServerAdders {
-			log.Printf("Attempting to connect to another server: %s", srv.String())
+			log.Printf("Try to connect to another server: %s.", srv.String())
 
 			srvConn, err := tls.Dial("tcp", srv.String(), conf)
 			if err == nil {
@@ -159,7 +166,8 @@ func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 				return srvConn, nil
 			}
 		}
-		return nil, errors.New(fmt.Sprintf("All attempts to connect to servers have failed."))
+
+		return nil, errors.New(fmt.Sprintf("all attempts to connect to servers have failed"))
 	}
 
 	log.Printf("Connection to server %s successful.", s.StableServer.String())

@@ -27,27 +27,27 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		proxyAdders = append(proxyAdders, addr)
 	}
 
-	/* Try to read and parses a public/private key pair from a pair of files. */
+	/* Try to read and parse the public/private key pairs from the file. */
 	cert, err := tls.LoadX509KeyPair(clientPEM, clientKEY)
 	if err != nil {
-		log.Println("Failed to read and parses public/private key pair from a pair of files")
+		log.Println("The client failed to read and parses the public/private key pairs from the file.")
 
 		return nil
 	}
 
 	certBytes, err := os.ReadFile(clientPEM)
 	if err != nil {
-		log.Println("Failed to read the client's PEM file")
+		log.Println("The client failed to read the client's PEM file.")
 
 		return nil
 	}
 
 	clientCertPool := x509.NewCertPool()
 
-	/* Try to attempt to parse a series of PEM encoded certificates. */
+	/* Try to attempt to parse the PEM encoded certificates. */
 	ok := clientCertPool.AppendCertsFromPEM(certBytes)
 	if !ok {
-		log.Println("failed to parse a series of PEM encoded certificates")
+		log.Println("The client failed to parse the PEM-encoded certificates.")
 
 		return nil
 	}
@@ -72,16 +72,18 @@ func (c *client) Listen() error {
 	for _, srv := range c.ServerAdders {
 		log.Printf("The configured server address is %s:%d.", srv.IP, srv.Port)
 	}
+
 	log.Printf("Using the default server address: %s:%d.", c.Service.StableServer.IP, c.Service.StableServer.Port)
 
 	listener, err := net.ListenTCP("tcp", c.ListenAddr)
 	if err != nil {
-		log.Printf("Failed to start client listening on %s", c.ListenAddr.String())
+		log.Printf("Failed to start the client listening on %s.", c.ListenAddr.String())
 
 		return err
 	} else {
-		log.Printf("The client successfully started listening on %s", c.ListenAddr.String())
+		log.Printf("The client successfully started listening on %s.", c.ListenAddr.String())
 	}
+
 	defer listener.Close()
 
 	for {
@@ -103,7 +105,8 @@ var srvPool = make(chan net.Conn, 32)
 func init() {
 	go func() {
 		for range time.Tick(5 * time.Second) {
-			p := <-srvPool /* Discard the idle connection */
+			/* Discard the idle connection. */
+			p := <-srvPool
 			_ = p.Close()
 		}
 	}()
@@ -116,7 +119,7 @@ func (c *client) newSrvConn() (net.Conn, error) {
 				proxy, err := c.DialSrv(c.conf)
 
 				if err != nil {
-					log.Println("Failed to connect to the server")
+					log.Println("The client failed to connect to the target server.")
 					return
 				}
 
@@ -179,11 +182,11 @@ func main() {
 
 	bytes, err := os.ReadFile(conf)
 	if err != nil {
-		log.Fatalf("Reading %s failed.", conf)
+		log.Fatalf("The client failed to read the configuration file.")
 	}
 
 	if err := json.Unmarshal(bytes, &config); err != nil {
-		log.Fatalf("Parsing %s failed.", conf)
+		log.Fatalf("The client failed to parse the configuration file: %s .", conf)
 	}
 
 	var srvAdders []string

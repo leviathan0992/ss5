@@ -34,28 +34,28 @@ func NewServer(listenAddr string, serverPEM string, serverKEY string, clientPEM 
 }
 
 func (s *server) ListenTLS() error {
-	log.Printf("The server's listening address is %s", s.ListenAddr.String())
+	log.Printf("The server's listening address is %s.", s.ListenAddr.String())
 
-	/* Try to read and parses a public/private key pair from a pair of files. */
+	/* Try to read and parse public/private key pairs from the file. */
 	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKEY)
 	if err != nil {
-		log.Println("Failed to read and parses public/private key pair from a pair of files")
+		log.Println("The server failed to read and parses public/private key pairs from the file.")
 
 		return err
 	}
 
 	certBytes, err := os.ReadFile(s.clientPEM)
 	if err != nil {
-		log.Println("Failed to read the client's PEM file")
+		log.Println("The server failed to read the client's PEM file.")
 
 		return err
 	}
 
 	clientCertPool := x509.NewCertPool()
-	/* Try to attempt to parse a series of PEM encoded certificates. */
+	/* Try to attempt to parse the PEM encoded certificates. */
 	ok := clientCertPool.AppendCertsFromPEM(certBytes)
 	if !ok {
-		return errors.New("failed to parse a series of PEM encoded certificates")
+		return errors.New("The server failed to parse the PEM-encoded certificates.")
 	}
 
 	config := &tls.Config{
@@ -66,11 +66,11 @@ func (s *server) ListenTLS() error {
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), config)
 	if err != nil {
-		log.Printf("Failed to start server listening on %s", s.ListenAddr.String())
+		log.Printf("Failed to start the server listening on %s.", s.ListenAddr.String())
 
 		return err
 	} else {
-		log.Printf("The server successfully started listening on %s", s.ListenAddr.String())
+		log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
 	}
 	defer listener.Close()
 
@@ -84,12 +84,12 @@ func (s *server) ListenTLS() error {
 }
 
 func (s *server) handleTLSConn(cliConn net.Conn) {
-	/* Parsing SOCKS5 over TLS connection. */
+	/* Parsing the SOCKS5 over TLS connection. */
 	dstAddr, err := s.ParseSOCKS5FromTLS(cliConn)
 	if err != nil {
 		_ = cliConn.Close()
 
-		log.Printf("Failed to parse SOCKS5 protocol: %s.", err.Error())
+		log.Printf("The server failed to parse the SOCKS5 protocol: %s.", err.Error())
 
 		return
 	}
@@ -98,11 +98,11 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 	dstConn, err := net.DialTCP("tcp", nil, dstAddr)
 	if err != nil {
 		_ = cliConn.Close()
-		log.Printf("Failed to connect to the destination address %s.", dstAddr.String())
+		log.Printf("The server failed to connect to the destination address %s.", dstAddr.String())
 
 		return
 	} else {
-		log.Printf("Connection to the destination address %s successful.", dstAddr.String())
+		log.Printf("The server connects to the destination address %s successful.", dstAddr.String())
 	}
 
 	_ = dstConn.SetLinger(0)
@@ -113,7 +113,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		_ = cliConn.Close()
 		_ = dstConn.Close()
 
-		log.Println("Server successfully connected to the target address, but failed to respond to the client")
+		log.Println("The server successfully connected to the target address, but failed to respond to the client.")
 
 		return
 	}
@@ -134,16 +134,16 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 func main() {
 	var conf string
 	var config map[string]interface{}
-	flag.StringVar(&conf, "c", ".ss5-server.json", "The server configuration file")
+	flag.StringVar(&conf, "c", ".ss5-server.json", "The server configuration file.")
 	flag.Parse()
 
 	bytes, err := os.ReadFile(conf)
 	if err != nil {
-		log.Fatalf("Failed to read file [%s]", conf)
+		log.Fatalf("The server failed to read the configuration file.")
 	}
 
 	if err := json.Unmarshal(bytes, &config); err != nil {
-		log.Fatalf("Failed to parse configuration file [%s]", conf)
+		log.Fatalf("The server failed to parse the configuration file: %s .", conf)
 	}
 
 	serverPEM := config["server_pem"].(string)
