@@ -1,7 +1,9 @@
 # ss5
-A Golang Implementation of SOCKS5 over TLS
+A Golang Implementation of SOCKS5 over TLS.
 
-This project provides a Golang implementation of a Socks5 over TLS proxy system, including client and server components. The client runs locally to convert regular Socks5 requests into encrypted TLS requests and forwards them to the remote server. The server receives and decrypts these requests for further processing.
+This project provides a Golang implementation of a SOCKS5 over TLS proxy system, including client and server components. The client runs locally to convert regular SOCKS5 requests into encrypted TLS requests and forwards them to the remote server. The server receives and decrypts these requests for further processing.
+
+Currently, the ss5 only supports the TCP/CONNECT command.
 
 ## Usage:
 1. Download the latest release package, for example:

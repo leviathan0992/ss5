@@ -15,7 +15,7 @@ import (
 
 type client struct {
 	*util.Service
-	conf *tls.Config
+	clientTLSConfig *tls.Config
 }
 
 func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY string) *client {
@@ -52,9 +52,10 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		return nil
 	}
 
-	config := &tls.Config{
-		RootCAs:            clientCertPool,
+	TLSconfig := &tls.Config{
+		MinVersion:         tls.VersionTLS10,
 		Certificates:       []tls.Certificate{cert},
+		RootCAs:            clientCertPool,
 		InsecureSkipVerify: true,
 	}
 
@@ -64,7 +65,7 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 			ServerAdders: proxyAdders,
 			StableServer: proxyAdders[0],
 		},
-		config,
+		TLSconfig,
 	}
 }
 
@@ -90,8 +91,11 @@ func (c *client) Listen() error {
 		userConn, err := listener.AcceptTCP()
 		if err != nil {
 			log.Println(err)
+
 			continue
 		}
+
+		_ = userConn.SetKeepAlive(true)
 
 		/* Discard any unsent or unacknowledged data. */
 		_ = userConn.SetLinger(0)
@@ -116,10 +120,10 @@ func (c *client) newSrvConn() (net.Conn, error) {
 	if len(srvPool) < 32 {
 		go func() {
 			for i := len(srvPool); i < 32; i++ {
-				proxy, err := c.DialSrv(c.conf)
+				proxy, err := c.DialSrv(c.clientTLSConfig)
 
 				if err != nil {
-					log.Println("The client failed to connect to the target server.")
+					log.Println("The client failed to connect to the server.")
 					return
 				}
 
@@ -132,17 +136,17 @@ func (c *client) newSrvConn() (net.Conn, error) {
 	case pc := <-srvPool:
 		return pc, nil
 	default:
-		return c.DialSrv(c.conf)
+		return c.DialSrv(c.clientTLSConfig)
 	}
 }
 
 func (c *client) connectServer(userConn *net.TCPConn) {
-	proxy, err := c.newSrvConn()
+	srvConn, err := c.DialSrv(c.clientTLSConfig)
 
 	if err != nil {
 		log.Println(err)
 
-		proxy, err = c.newSrvConn()
+		srvConn, err = c.newSrvConn()
 		if err != nil {
 			log.Println(err)
 
@@ -152,20 +156,22 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 		return
 	}
 
-	defer proxy.Close()
+	defer srvConn.Close()
 
 	go func() {
-		/* Using TCP connection between server and client. */
-		errTransfer := c.TransferToTCP(proxy, userConn)
+		/* The client and server communicate using the TLS connection,
+		 * while the server and target address communicate using the TCP connection. */
+		errTransfer := c.TransferToTCP(srvConn, userConn)
 
 		if errTransfer != nil {
 			_ = userConn.Close()
-			_ = proxy.Close()
+			_ = srvConn.Close()
 		}
 	}()
 
-	/* Using TLS connection directly between client and server. */
-	_ = c.TransferToTLS(userConn, proxy)
+	/* The client and server communicate using the TLS connection,
+	 * while the server and target address communicate using the TCP connection. */
+	_ = c.TransferToTLS(userConn, srvConn)
 }
 
 func (c *client) handleConn(userConn *net.TCPConn) {

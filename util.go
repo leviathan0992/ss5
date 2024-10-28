@@ -10,8 +10,8 @@ import (
 	"sync"
 )
 
-/* The buffer (2M) is used after successful authentication between the connections. */
-const ConnectionBuffer = 1024 * 1024 * 2
+/* The buffer (6M) is used after successful authentication between the connections. */
+const ConnectionBuffer = 1024 * 1024 * 6
 
 /* The buffer (256 KB) is used for parsing SOCKS5. */
 const Socks5Buffer = 256 * 1024
@@ -19,6 +19,7 @@ const Socks5Buffer = 256 * 1024
 var bytePool = sync.Pool{
 	New: func() interface{} {
 		bytes := make([]byte, ConnectionBuffer)
+
 		return bytes
 	},
 }
@@ -45,10 +46,10 @@ func (s *Service) TLSWrite(conn net.Conn, buf []byte) error {
 	return nil
 }
 
-func (s *Service) TransferToTCP(cliConn net.Conn, dstConn *net.TCPConn) error {
+func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 	buf := make([]byte, ConnectionBuffer)
 	for {
-		nRead, errRead := cliConn.Read(buf)
+		nRead, errRead := srcConn.Read(buf)
 
 		if errRead != nil {
 			return errRead
@@ -72,6 +73,7 @@ func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
 
 		if errRead != nil {
 			bytePool.Put(buf)
+
 			return errRead
 		}
 
@@ -80,6 +82,7 @@ func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
 
 			if errWrite != nil {
 				bytePool.Put(buf)
+
 				return errWrite
 			}
 		}
@@ -97,7 +100,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 	if nRead > 0 {
 		if buf[0] != 0x05 {
 			/* The version of the protocol. */
-			return &net.TCPAddr{}, errors.New("currently only supporting SOCKS5 protocol")
+			return &net.TCPAddr{}, errors.New("currently only supporting the SOCKS5 protocol")
 		} else {
 			/* [SOCKS5, NO AUTHENTICATION REQUIRED]  */
 			errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00})
@@ -118,7 +121,8 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 		}
 
 		var dstIP []byte
-		switch buf[3] { /* Checking the address field. */
+		switch buf[3] {
+		/* Checking the address field. */
 		case 0x01: /* The version-4 IP address. */
 			dstIP = buf[4 : 4+net.IPv4len]
 

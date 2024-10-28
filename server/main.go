@@ -58,13 +58,14 @@ func (s *server) ListenTLS() error {
 		return errors.New("The server failed to parse the PEM-encoded certificates.")
 	}
 
-	config := &tls.Config{
+	serverTLSConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS10,
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    clientCertPool,
 	}
 
-	listener, err := tls.Listen("tcp", s.ListenAddr.String(), config)
+	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
 	if err != nil {
 		log.Printf("Failed to start the server listening on %s.", s.ListenAddr.String())
 
@@ -72,6 +73,7 @@ func (s *server) ListenTLS() error {
 	} else {
 		log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
 	}
+
 	defer listener.Close()
 
 	for {
@@ -79,6 +81,7 @@ func (s *server) ListenTLS() error {
 		if err != nil {
 			continue
 		}
+
 		go s.handleTLSConn(cliConn)
 	}
 }
@@ -94,7 +97,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		return
 	}
 
-	/* Attempting to connect to the target address. */
+	/* Attempting to connect to the destination address. */
 	dstConn, err := net.DialTCP("tcp", nil, dstAddr)
 	if err != nil {
 		_ = cliConn.Close()
@@ -105,21 +108,25 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		log.Printf("The server connects to the destination address %s successful.", dstAddr.String())
 	}
 
+	_ = dstConn.SetKeepAlive(true)
+
+	/* Discard any unsent or unacknowledged data. */
 	_ = dstConn.SetLinger(0)
 
-	/* Connection to the target address successful, responding to the client. */
+	/* Connection to the destination address successful, responding to the client. */
 	errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	if errWrite != nil {
 		_ = cliConn.Close()
 		_ = dstConn.Close()
 
-		log.Println("The server successfully connected to the target address, but failed to respond to the client.")
+		log.Println("The server successfully connected to the destination address, but failed to respond to the client.")
 
 		return
 	}
 
-	/* Using TCP connection between server and target address. */
 	go func() {
+		/* The client and server communicate using the TLS connection,
+		 * while the server and destination address communicate using the TCP connection. */
 		errTransfer := s.TransferToTCP(cliConn, dstConn)
 		if errTransfer != nil {
 			_ = cliConn.Close()
@@ -127,7 +134,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		}
 	}()
 
-	/* Using TLS connection directly between client and server. */
+	/* The client and server communicate using the TLS connection,
+	 * while the server and destination address communicate using the TCP connection. */
 	_ = s.TransferToTLS(dstConn, cliConn)
 }
 
