@@ -5,19 +5,31 @@ This project provides a Golang implementation of a SOCKS5 over TLS proxy system,
 
 Currently, the ss5 only supports the TCP/CONNECT command.
 
+```
+ --------------                              --------------
+|              |                            |              |
+|              |   SOCKS5 OVER TLS (TCP)    |              |
+|  ss5-client  |  ----------------------->  |  ss5-server  |
+|              |                            |              |
+|              |                            |              |
+ --------------                              --------------
+```
+
 ## Usage:
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/Mesaukee/ss5/releases/download/v0.0.1/ss5_0.0.1_Linux_64-bit.tar.gz
+   wget https://github.com/Mesaukee/ss5/releases/download/v0.0.3/ss5_0.0.3_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.0.1_Linux_64-bit.tar.gz
+   tar -zxvf ss5_0.0.3_Linux_x86_64.tar.gz
    
-   cd ss5_0.0.1_Linux_64-bit
+   cd ss5_0.0.3_Linux_x86_64
    ```
-2. Configure the Client:
-   `vim .ss5-client.json`
    
-   ```json
+2. Configure the ss5-client and fill in the ss5-server address:
+   
+   ```shell
+   # vim .ss5-client.json
+   
    {
     "server_addr": [
       "127.0.0.1:58",
@@ -29,13 +41,16 @@ Currently, the ss5 only supports the TCP/CONNECT command.
     }
    ```
    
-3. Start the Client:
-   `./ss5-client -c .ss5-client.json`
+4. Start the ss5-client:
+   ```shell
+   ./ss5-client -c .ss5-client.json
+   ```
    
-4. Configure the Server:
-   `vim .ss5-server.json`
+6. Configure the ss5-server:
+ 
+   ```shell
+   # vim .ss5-server.json
    
-   ```json
    {
     "listen_addr": "0.0.0.0:443",
     "server_key": "/etc/server.key",
@@ -43,8 +58,10 @@ Currently, the ss5 only supports the TCP/CONNECT command.
     "client_pem": "/etc/client.pem"
     }
    ```
-7. Start the Server:
-   `./ss5-server -c .ss5-server.json`
+7. Start the ss5-server:
+   ```shell
+   ./ss5-server -c .ss5-server.json
+   ```
 
 ## License:
 
