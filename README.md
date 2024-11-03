@@ -1,7 +1,10 @@
 # ss5
+
 A Golang Implementation of SOCKS5 over TLS.
 
-This project provides a Golang implementation of a SOCKS5 over TLS proxy system, including client and server components. The client runs locally to convert regular SOCKS5 requests into encrypted TLS requests and forwards them to the remote server. The server receives and decrypts these requests for further processing.
+This project provides a Golang implementation of a SOCKS5 over TLS proxy system, including client and server components.
+The client runs locally to convert regular SOCKS5 requests into encrypted TLS requests and forwards them to the remote
+server. The server receives and decrypts these requests for further processing.
 
 Currently, the ss5 only supports the TCP/CONNECT command.
 
@@ -16,6 +19,7 @@ Currently, the ss5 only supports the TCP/CONNECT command.
 ```
 
 ## Usage:
+
 1. Download the latest release package, for example:
    ``` shell
    wget https://github.com/Mesaukee/ss5/releases/download/v0.0.3/ss5_0.0.3_Linux_x86_64.tar.gz
@@ -24,9 +28,9 @@ Currently, the ss5 only supports the TCP/CONNECT command.
    
    cd ss5_0.0.3_Linux_x86_64
    ```
-   
+
 2. Configure the ss5-client and fill in the ss5-server address:
-   
+
    ```shell
    # vim .ss5-client.json
    
@@ -40,14 +44,14 @@ Currently, the ss5 only supports the TCP/CONNECT command.
     "client_key": "/etc/client.key"
     }
    ```
-   
+
 4. Start the ss5-client:
    ```shell
    ./ss5-client -c .ss5-client.json
    ```
-   
+
 6. Configure the ss5-server:
- 
+
    ```shell
    # vim .ss5-server.json
    
