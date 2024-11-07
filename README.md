@@ -22,7 +22,7 @@ Currently, the ss5 only supports the TCP/CONNECT command.
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/Mesaukee/ss5/releases/download/v0.0.3/ss5_0.0.3_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.0.3/ss5_0.0.3_Linux_x86_64.tar.gz
    
    tar -zxvf ss5_0.0.3_Linux_x86_64.tar.gz
    

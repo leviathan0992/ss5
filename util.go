@@ -5,22 +5,29 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
 )
 
-/* The buffer (6M) is used after successful authentication between the connections. */
-const ConnectionBuffer = 1024 * 1024 * 6
+/* The buffer (2M) is used after successful authentication between the connections. */
+const ConnectionBuffer = 2 * 1024 * 1024
 
-/* The buffer (256 KB) is used for parsing SOCKS5. */
-const Socks5Buffer = 256 * 1024
+/* The buffer (8KB) is used for parsing SOCKS5. */
+const Socks5Buffer = 8 * 1024
 
 var bytePool = sync.Pool{
 	New: func() interface{} {
 		bytes := make([]byte, ConnectionBuffer)
 
 		return bytes
+	},
+}
+
+var socks5Pool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, Socks5Buffer)
 	},
 }
 
@@ -31,66 +38,31 @@ type Service struct {
 }
 
 func (s *Service) TLSWrite(conn net.Conn, buf []byte) error {
-	nWrite := 0
-	nBuffer := len(buf)
-
-	for nWrite < nBuffer {
-		n, err := conn.Write(buf[nWrite:])
-		if err != nil {
-			return err
-		}
-
-		nWrite += n
-	}
-
-	return nil
+	_, err := conn.Write(buf)
+	return err
 }
 
 func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
-	buf := make([]byte, ConnectionBuffer)
-	for {
-		nRead, errRead := srcConn.Read(buf)
+	buf := bytePool.Get().([]byte)
+	defer bytePool.Put(buf)
 
-		if errRead != nil {
-			return errRead
-		}
+	_, err := io.CopyBuffer(dstConn, srcConn, buf)
 
-		if nRead > 0 {
-			_, errWrite := dstConn.Write(buf[0:nRead])
-
-			if errWrite != nil {
-				return errWrite
-			}
-		}
-	}
+	return err
 }
 
 func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
 	buf := bytePool.Get().([]byte)
+	defer bytePool.Put(buf)
 
-	for {
-		nRead, errRead := dstConn.Read(buf)
+	_, err := io.CopyBuffer(srcConn, dstConn, buf)
 
-		if errRead != nil {
-			bytePool.Put(buf)
-
-			return errRead
-		}
-
-		if nRead > 0 {
-			errWrite := s.TLSWrite(srcConn, buf[0:nRead])
-
-			if errWrite != nil {
-				bytePool.Put(buf)
-
-				return errWrite
-			}
-		}
-	}
+	return err
 }
 
 func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
-	buf := make([]byte, Socks5Buffer)
+	buf := socks5Pool.Get().([]byte)
+	defer socks5Pool.Put(buf)
 
 	nRead, errRead := cliConn.Read(buf)
 	if errRead != nil {
@@ -131,6 +103,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 			if err != nil {
 				return &net.TCPAddr{}, errors.New("the service failed to parse the domain name")
 			}
+
 			dstIP = ipAddr.IP
 		case 0x04: /* The version-6 IP address. */
 			dstIP = buf[4 : 4+net.IPv6len]

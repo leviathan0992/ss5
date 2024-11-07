@@ -71,7 +71,7 @@ release:
   # Repo in which the release will be created.
   # Default is extracted from the origin remote URL or empty if its private hosted.
   github:
-    owner: Mesaukee
+    owner: Leviathan0992
     name: ss5
 
   # If set to true, will not auto-publish the release.

@@ -1,3 +1,3 @@
-module github.com/Mesaukee/ss5
+module github.com/leviathan0992/ss5
 
-go 1.21.13
+go 1.22.2
