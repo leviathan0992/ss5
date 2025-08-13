@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	util "github.com/Mesaukee/ss5"
@@ -99,6 +100,7 @@ func (c *client) Listen() error {
 
 		/* Discard any unsent or unacknowledged data. */
 		_ = userConn.SetLinger(0)
+		_ = userConn.SetNoDelay(true)
 
 		go c.handleConn(userConn)
 	}
@@ -158,20 +160,28 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 
 	defer srvConn.Close()
 
-	go func() {
-		/* The client and server communicate using the TLS connection,
-		 * while the server and target address communicate using the TCP connection. */
-		errTransfer := c.TransferToTCP(srvConn, userConn)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-		if errTransfer != nil {
-			_ = userConn.Close()
-			_ = srvConn.Close()
+	go func() {
+		defer wg.Done()
+
+		if err := c.TransferToTCP(srvConn, userConn); err != nil {
+			log.Printf("The connection closed: %v", err)
+		}
+
+		_ = userConn.CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		if err := c.TransferToTLS(userConn, srvConn); err != nil {
+			log.Printf("The connection closed: %v", err)
 		}
 	}()
 
-	/* The client and server communicate using the TLS connection,
-	 * while the server and target address communicate using the TCP connection. */
-	_ = c.TransferToTLS(userConn, srvConn)
+	wg.Wait()
 }
 
 func (c *client) handleConn(userConn *net.TCPConn) {
