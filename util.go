@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 /* The buffer (2M) is used after successful authentication between the connections. */
@@ -128,7 +129,12 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 }
 
 func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
-	srvConn, err := tls.Dial("tcp", s.StableServer.String(), conf)
+	dial := func(addr string) (net.Conn, error) {
+		d := &net.Dialer{Timeout: 1 * time.Second}
+		return tls.DialWithDialer(d, "tcp", addr, conf)
+	}
+
+	srvConn, err := dial(s.StableServer.String())
 	if err != nil {
 		log.Printf("The service failed to connect to the server %s failed: %s.", s.StableServer.String(), err)
 
@@ -136,7 +142,7 @@ func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 		for _, srv := range s.ServerAdders {
 			log.Printf("Try to connect to another server: %s.", srv.String())
 
-			srvConn, err := tls.Dial("tcp", srv.String(), conf)
+			srvConn, err = dial(srv.String())
 			if err == nil {
 				s.StableServer = srv
 
