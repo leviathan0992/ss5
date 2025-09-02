@@ -130,7 +130,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 
 func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 	dial := func(addr string) (net.Conn, error) {
-		d := &net.Dialer{Timeout: 500 * time.Millisecond}
+		d := &net.Dialer{Timeout: 1 * time.Second}
 		return tls.DialWithDialer(d, "tcp", addr, conf)
 	}
 
