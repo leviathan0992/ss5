@@ -6,7 +6,7 @@ This project provides a Golang implementation of a SOCKS5 over TLS proxy system,
 The client runs locally to convert regular SOCKS5 requests into encrypted TLS requests and forwards them to the remote
 server. The server receives and decrypts these requests for further processing.
 
-Currently, the ss5 only supports the TCP/CONNECT command.
+Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
 
 ```
  --------------                              --------------
