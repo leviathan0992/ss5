@@ -24,7 +24,7 @@ type server struct {
 	clientPEM string
 }
 
-/* buildUDPResponse encodes a SOCKS5 UDP reply header and payload into buf for dst. */
+/* Encodes a SOCKS5 UDP reply header and payload into buf for dst. */
 func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) {
 	/* Ensuring the buffer can hold the fixed 3-byte reserved header. */
 	if len(buf) < 3 {
