@@ -15,6 +15,9 @@ import (
 /* The buffer (2M) is used after successful authentication between the connections. */
 const ConnectionBuffer = 2 * 1024 * 1024
 
+/* The buffer (64KB) is used for relaying UDP payloads. */
+const UDPBuffer = 64 * 1024
+
 /* The buffer (8KB) is used for parsing SOCKS5. */
 const Socks5Buffer = 8 * 1024
 
@@ -23,6 +26,12 @@ var bytePool = sync.Pool{
 		bytes := make([]byte, ConnectionBuffer)
 
 		return bytes
+	},
+}
+
+var udpPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, UDPBuffer)
 	},
 }
 
@@ -61,36 +70,44 @@ func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
 	return err
 }
 
-func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
+func GetUDPBuffer() []byte {
+	return udpPool.Get().([]byte)
+}
+
+func PutUDPBuffer(buf []byte) {
+	udpPool.Put(buf)
+}
+
+func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	buf := socks5Pool.Get().([]byte)
 	defer socks5Pool.Put(buf)
 
 	nRead, errRead := cliConn.Read(buf)
 	if errRead != nil {
-		return &net.TCPAddr{}, errors.New("the service failed to read SOCKS5 during the initial handshake phase")
+		return nil, 0x00, errors.New("the service failed to read SOCKS5 during the initial handshake phase")
 	}
 
 	if nRead > 0 {
 		if buf[0] != 0x05 {
 			/* The version of the protocol. */
-			return &net.TCPAddr{}, errors.New("currently only supporting the SOCKS5 protocol")
+			return nil, 0x00, errors.New("currently only supporting the SOCKS5 protocol")
 		} else {
 			/* [SOCKS5, NO AUTHENTICATION REQUIRED]  */
 			errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00})
 			if errWrite != nil {
-				return &net.TCPAddr{}, errors.New("the service failed to respond to the client during the SOCKS5 initial handshake phase")
+				return nil, 0x00, errors.New("the service failed to respond to the client during the SOCKS5 initial handshake phase")
 			}
 		}
 	}
 
 	nRead, errRead = cliConn.Read(buf)
 	if errRead != nil {
-		return &net.TCPAddr{}, errors.New("the service failed to read SOCKS5 during the second handshake phase")
+		return nil, 0x00, errors.New("the service failed to read SOCKS5 during the second handshake phase")
 	}
 
 	if nRead > 0 {
-		if buf[1] != 0x01 {
-			return &net.TCPAddr{}, errors.New("currently only supporting the CONNECT command in SOCKS5")
+		if buf[1] != 0x01 && buf[1] != 0x03 {
+			return nil, 0x00, errors.New("currently only supporting the CONNECT and UDP ASSOCIATE commands in SOCKS5")
 		}
 
 		var dstIP []byte
@@ -102,14 +119,14 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 		case 0x03: /* The fully-qualified domain name. */
 			ipAddr, err := net.ResolveIPAddr("ip", string(buf[5:nRead-2]))
 			if err != nil {
-				return &net.TCPAddr{}, errors.New("the service failed to parse the domain name")
+				return nil, 0x00, errors.New("the service failed to parse the domain name")
 			}
 
 			dstIP = ipAddr.IP
 		case 0x04: /* The version-6 IP address. */
 			dstIP = buf[4 : 4+net.IPv6len]
 		default:
-			return &net.TCPAddr{}, errors.New("the received address field is incorrect")
+			return nil, 0x00, errors.New("the received address field is incorrect")
 		}
 
 		dstPort := buf[nRead-2 : nRead]
@@ -121,11 +138,19 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (*net.TCPAddr, error) {
 				Port: int(binary.BigEndian.Uint16(dstPort)),
 			}
 
-			return dstAddr, errRead
+			return dstAddr, buf[1], errRead
+		} else if buf[1] == 0x03 {
+			/* The UDP over SOCKS5. */
+			dstAddr := &net.UDPAddr{
+				IP:   dstIP,
+				Port: int(binary.BigEndian.Uint16(dstPort)),
+			}
+
+			return dstAddr, buf[1], errRead
 		}
 	}
 
-	return &net.TCPAddr{}, errors.New("the service failed to parse the SOCKS5 protocol")
+	return nil, 0x00, errors.New("the service failed to parse the SOCKS5 protocol")
 }
 
 func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
