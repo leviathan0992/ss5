@@ -1,4 +1,4 @@
-package util
+package ss5
 
 import (
 	"crypto/tls"
@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-/* The buffer (2M) is used after successful authentication between the connections. */
-const ConnectionBuffer = 2 * 1024 * 1024
+/* The buffer (512KB) is used after successful authentication between the connections. */
+const ConnectionBuffer = 512 * 1024
 
 /* The buffer (64KB) is used for relaying UDP payloads. */
 const UDPBuffer = 64 * 1024
@@ -56,6 +56,9 @@ func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 	buf := bytePool.Get().([]byte)
 	defer bytePool.Put(buf)
 
+	_ = srcConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	_ = dstConn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+
 	_, err := io.CopyBuffer(dstConn, srcConn, buf)
 
 	return err
@@ -64,6 +67,9 @@ func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
 	buf := bytePool.Get().([]byte)
 	defer bytePool.Put(buf)
+
+	_ = dstConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	_ = srcConn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 
 	_, err := io.CopyBuffer(srcConn, dstConn, buf)
 
@@ -155,7 +161,10 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 
 func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 	dial := func(addr string) (net.Conn, error) {
-		d := &net.Dialer{Timeout: 1 * time.Second}
+		d := &net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
 		return tls.DialWithDialer(d, "tcp", addr, conf)
 	}
 

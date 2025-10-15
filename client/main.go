@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	util "github.com/Mesaukee/ss5"
+	util "github.com/leviathan0992/ss5"
 )
 
 type client struct {
@@ -54,10 +54,11 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 	}
 
 	TLSconfig := &tls.Config{
-		MinVersion:         tls.VersionTLS10,
+		MinVersion:         tls.VersionTLS12,
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            clientCertPool,
 		InsecureSkipVerify: true,
+		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
 	return &client{
@@ -97,64 +98,64 @@ func (c *client) Listen() error {
 		}
 
 		_ = userConn.SetKeepAlive(true)
+		_ = userConn.SetKeepAlivePeriod(30 * time.Second)
 
 		/* Discard any unsent or unacknowledged data. */
 		_ = userConn.SetLinger(0)
 		_ = userConn.SetNoDelay(true)
+		_ = userConn.SetReadBuffer(128 * 1024)
+		_ = userConn.SetWriteBuffer(128 * 1024)
 
 		go c.handleConn(userConn)
 	}
 }
 
-var srvPool = make(chan net.Conn, 32)
+var (
+	srvPool    = make(chan net.Conn, 32)
+	poolClosed bool
+	poolMutex  sync.Mutex
+)
 
 func init() {
 	go func() {
-		for range time.Tick(5 * time.Second) {
-			/* Discard the idle connection. */
-			p := <-srvPool
-			_ = p.Close()
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			poolMutex.Lock()
+			if poolClosed {
+				poolMutex.Unlock()
+				return
+			}
+			poolMutex.Unlock()
+
+			for len(srvPool) > 8 {
+				select {
+				case conn := <-srvPool:
+					_ = conn.Close()
+				default:
+					return
+				}
+			}
 		}
 	}()
 }
 
-func (c *client) newSrvConn() (net.Conn, error) {
-	if len(srvPool) < 32 {
-		go func() {
-			for i := len(srvPool); i < 32; i++ {
-				proxy, err := c.DialSrv(c.clientTLSConfig)
-
-				if err != nil {
-					log.Println("The client failed to connect to the server.")
-					return
-				}
-
-				srvPool <- proxy
-			}
-		}()
-	}
-
+func (c *client) getConn() (net.Conn, error) {
 	select {
-	case pc := <-srvPool:
-		return pc, nil
+	case conn := <-srvPool:
+		return conn, nil
 	default:
 		return c.DialSrv(c.clientTLSConfig)
 	}
 }
 
+
+
 func (c *client) connectServer(userConn *net.TCPConn) {
-	srvConn, err := c.DialSrv(c.clientTLSConfig)
-
+	srvConn, err := c.getConn()
 	if err != nil {
-		log.Println(err)
-
-		srvConn, err = c.newSrvConn()
-		if err != nil {
-			log.Println(err)
-
-			return
-		}
-
+		log.Printf("Failed to get server connection: %v", err)
 		return
 	}
 

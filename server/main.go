@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	util "github.com/Mesaukee/ss5"
+	util "github.com/leviathan0992/ss5"
 )
 
 type server struct {
@@ -114,10 +114,12 @@ func (s *server) ListenTLS() error {
 	}
 
 	serverTLSConfig := &tls.Config{
-		MinVersion:   tls.VersionTLS10,
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    clientCertPool,
+		MinVersion:         tls.VersionTLS12,
+		Certificates:       []tls.Certificate{cert},
+		ClientAuth:         tls.RequireAndVerifyClientCert,
+		ClientCAs:          clientCertPool,
+		SessionTicketsDisabled: false,
+		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
@@ -168,12 +170,11 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		log.Printf("The server connects to the destination address %s successful.", dstAddr.String())
 
 		_ = dstConn.SetKeepAlive(true)
-
-		/* Discard any unsent or unacknowledged data. */
+		_ = dstConn.SetKeepAlivePeriod(30 * time.Second)
 		_ = dstConn.SetLinger(0)
-
-		/* Disable Nagle algorithm to reduce latency. */
 		_ = dstConn.SetNoDelay(true)
+		_ = dstConn.SetReadBuffer(128 * 1024)
+		_ = dstConn.SetWriteBuffer(128 * 1024)
 
 		/* Connection to the destination address successful, responding to the client. */
 		errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})

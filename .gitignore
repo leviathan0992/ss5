@@ -23,3 +23,6 @@ go.work
 *.idea/*
 dist/
 tags
+build/
+client/client
+server/server
