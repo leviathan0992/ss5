@@ -114,12 +114,12 @@ func (s *server) ListenTLS() error {
 	}
 
 	serverTLSConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		Certificates:       []tls.Certificate{cert},
-		ClientAuth:         tls.RequireAndVerifyClientCert,
-		ClientCAs:          clientCertPool,
+		MinVersion:             tls.VersionTLS12,
+		Certificates:           []tls.Certificate{cert},
+		ClientAuth:             tls.RequireAndVerifyClientCert,
+		ClientCAs:              clientCertPool,
 		SessionTicketsDisabled: false,
-		ClientSessionCache: tls.NewLRUClientSessionCache(128),
+		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
 	}
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
@@ -177,7 +177,18 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		_ = dstConn.SetWriteBuffer(128 * 1024)
 
 		/* Connection to the destination address successful, responding to the client. */
-		errWrite := s.TLSWrite(cliConn, []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		var resp []byte
+		if ip4 := dstAddr.IP.To4(); ip4 != nil {
+			/* IPV4. */
+			resp = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		} else {
+			/* IPv6. */
+			resp = []byte{0x05, 0x00, 0x00, 0x04}
+			resp = append(resp, make([]byte, 16)...)
+			resp = append(resp, 0x00, 0x00)
+		}
+
+		errWrite := s.TLSWrite(cliConn, resp)
 		if errWrite != nil {
 			log.Println("The server successfully connected to the destination address, but failed to respond to the client.")
 
