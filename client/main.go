@@ -66,6 +66,7 @@ func (p *connPool) warmUp() {
 		} else {
 			conn.Close()
 		}
+
 		p.mu.Unlock()
 	}
 }
@@ -79,6 +80,7 @@ func (p *connPool) maintain() {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
+
 			return
 		}
 
@@ -112,6 +114,7 @@ func (p *connPool) maintain() {
 				} else {
 					conn.Close()
 				}
+
 				p.mu.Unlock()
 			}
 		}
@@ -141,6 +144,7 @@ func (p *connPool) get() (net.Conn, error) {
 			if err != nil && err.Error() != "i/o timeout" && !isTimeoutError(err) {
 				pc.conn.Close()
 				p.mu.Lock()
+
 				continue
 			}
 
@@ -199,12 +203,25 @@ type client struct {
 }
 
 func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY string) *client {
-	listenAddr, _ := net.ResolveTCPAddr("tcp", listen)
+	listenAddr, err := net.ResolveTCPAddr("tcp", listen)
+	if err != nil {
+		log.Printf("Failed to resolve listen address %s: %v", listen, err)
+		return nil
+	}
 
 	var proxyAdders []*net.TCPAddr
 	for _, srvAddr := range srvAdders {
-		addr, _ := net.ResolveTCPAddr("tcp", srvAddr)
+		addr, err := net.ResolveTCPAddr("tcp", srvAddr)
+		if err != nil {
+			log.Printf("Failed to resolve server address %s: %v", srvAddr, err)
+			continue
+		}
 		proxyAdders = append(proxyAdders, addr)
+	}
+
+	if len(proxyAdders) == 0 {
+		log.Println("No valid server addresses provided")
+		return nil
 	}
 
 	/* Try to read and parse the public/private key pairs from the file. */
@@ -312,7 +329,8 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		if err := c.TransferToTCP(srvConn, userConn); err != nil {
+		/* TLS -> TCP: Use splice-optimized transfer. */
+		if err := c.SpliceTransferToTCP(srvConn, userConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
 
@@ -322,7 +340,8 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		if err := c.TransferToTLS(userConn, srvConn); err != nil {
+		/* TCP -> TLS: Use splice-optimized transfer. */
+		if err := c.SpliceTransferToTLS(userConn, srvConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
 	}()
@@ -352,16 +371,36 @@ func main() {
 	}
 
 	var srvAdders []string
-	srvAddr, _ := config["server_addr"].([]interface{})
-
-	for _, ip := range srvAddr {
-		srvAdders = append(srvAdders, ip.(string))
+	srvAddr, ok := config["server_addr"].([]interface{})
+	if !ok {
+		log.Fatalf("Invalid server_addr in configuration file")
 	}
 
-	clientPEM := config["client_pem"].(string)
-	clientKEY := config["client_key"].(string)
+	for _, ip := range srvAddr {
+		if ipStr, ok := ip.(string); ok {
+			srvAdders = append(srvAdders, ipStr)
+		}
+	}
 
-	c := NewClient(config["listen_addr"].(string), srvAdders, clientPEM, clientKEY)
+	clientPEM, ok := config["client_pem"].(string)
+	if !ok {
+		log.Fatalf("Invalid client_pem in configuration file")
+	}
+
+	clientKEY, ok := config["client_key"].(string)
+	if !ok {
+		log.Fatalf("Invalid client_key in configuration file")
+	}
+
+	listenAddr, ok := config["listen_addr"].(string)
+	if !ok {
+		log.Fatalf("Invalid listen_addr in configuration file")
+	}
+
+	c := NewClient(listenAddr, srvAdders, clientPEM, clientKEY)
+	if c == nil {
+		log.Fatalf("Failed to create client")
+	}
 
 	_ = c.Listen()
 }

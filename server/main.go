@@ -76,7 +76,11 @@ func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) 
 }
 
 func NewServer(listenAddr string, serverPEM string, serverKEY string, clientPEM string) *server {
-	tcpAddr, _ := net.ResolveTCPAddr("tcp", listenAddr)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
+	if err != nil {
+		log.Printf("Failed to resolve listen address %s: %v", listenAddr, err)
+		return nil
+	}
 
 	return &server{
 		&util.Service{
@@ -179,7 +183,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		/* Connection to the destination address successful, responding to the client. */
 		var resp []byte
 		if ip4 := dstAddr.IP.To4(); ip4 != nil {
-			/* IPV4. */
+			/* IPv4. */
 			resp = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 		} else {
 			/* IPv6. */
@@ -201,7 +205,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		go func() {
 			defer wg.Done()
 
-			if err := s.TransferToTCP(cliConn, dstConn); err != nil {
+			/* TLS -> TCP: Use splice-optimized transfer. */
+			if err := s.SpliceTransferToTCP(cliConn, dstConn); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 
@@ -211,7 +216,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		go func() {
 			defer wg.Done()
 
-			if err := s.TransferToTLS(dstConn, cliConn); err != nil {
+			/* TCP -> TLS: Use splice-optimized transfer. */
+			if err := s.SpliceTransferToTLS(dstConn, cliConn); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 		}()
@@ -302,7 +308,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 
 			dstAddr = &net.UDPAddr{IP: ip, Port: port}
 			headerLen = 10
-
 		} else if addressType == 0x03 { /* The domain name. */
 			hostLen := int(buf[4])
 			if 5+hostLen+2 > n {
@@ -319,7 +324,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 
 			dstAddr = addr
 			headerLen = 5 + hostLen + 2
-
 		} else if addressType == 0x04 { /* IPv6. */
 			if n < 22 {
 				continue
@@ -331,12 +335,15 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 
 			dstAddr = &net.UDPAddr{IP: ip, Port: port}
 			headerLen = 22
-
 		} else { /* Unknown address type. */
 			continue
 		}
 
 		payload := buf[headerLen:n]
+
+		if dstAddr == nil {
+			continue
+		}
 
 		dstConn, err := net.DialUDP("udp", nil, dstAddr)
 		if err != nil {
@@ -381,11 +388,30 @@ func main() {
 		log.Fatalf("The server failed to parse the configuration file: %s .", conf)
 	}
 
-	serverPEM := config["server_pem"].(string)
-	serverKEY := config["server_key"].(string)
-	clientPEM := config["client_pem"].(string)
+	serverPEM, ok := config["server_pem"].(string)
+	if !ok {
+		log.Fatalf("Invalid server_pem in configuration file")
+	}
 
-	s := NewServer(config["listen_addr"].(string), serverPEM, serverKEY, clientPEM)
+	serverKEY, ok := config["server_key"].(string)
+	if !ok {
+		log.Fatalf("Invalid server_key in configuration file")
+	}
+
+	clientPEM, ok := config["client_pem"].(string)
+	if !ok {
+		log.Fatalf("Invalid client_pem in configuration file")
+	}
+
+	listenAddr, ok := config["listen_addr"].(string)
+	if !ok {
+		log.Fatalf("Invalid listen_addr in configuration file")
+	}
+
+	s := NewServer(listenAddr, serverPEM, serverKEY, clientPEM)
+	if s == nil {
+		log.Fatalf("Failed to create server")
+	}
 
 	s.ListenTLS()
 }
