@@ -45,12 +45,12 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
     }
    ```
 
-4. Start the ss5-client:
+3. Start the ss5-client:
    ```shell
    ./ss5-client -c .ss5-client.json
    ```
 
-6. Configure the ss5-server:
+4. Configure the ss5-server:
 
    ```shell
    # vim .ss5-server.json
@@ -62,7 +62,7 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
     "client_pem": "/etc/client.pem"
     }
    ```
-7. Start the ss5-server:
+5. Start the ss5-server:
    ```shell
    ./ss5-server -c .ss5-server.json
    ```

@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,8 +11,8 @@ import (
 	"time"
 )
 
-/* The buffer (512KB) is used after successful authentication between the connections. */
-const ConnectionBuffer = 512 * 1024
+/* The buffer (64KB) is used after successful authentication between the connections. */
+const ConnectionBuffer = 64 * 1024
 
 /* The buffer (64KB) is used for relaying UDP payloads. */
 const UDPBuffer = 64 * 1024
@@ -123,7 +122,11 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 			dstIP = buf[4 : 4+net.IPv4len]
 
 		case 0x03: /* The fully-qualified domain name. */
-			ipAddr, err := net.ResolveIPAddr("ip", string(buf[5:nRead-2]))
+			domainLen := int(buf[4])
+			if 5+domainLen+2 > nRead {
+				return nil, 0x00, errors.New("the domain name length exceeds the buffer")
+			}
+			ipAddr, err := net.ResolveIPAddr("ip", string(buf[5:5+domainLen]))
 			if err != nil {
 				return nil, 0x00, errors.New("the service failed to parse the domain name")
 			}
@@ -184,7 +187,7 @@ func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
 			}
 		}
 
-		return nil, errors.New(fmt.Sprintf("all attempts to connect to servers have failed"))
+		return nil, errors.New("all attempts to connect to servers have failed")
 	}
 
 	log.Printf("Connection to server %s successful.", s.StableServer.String())

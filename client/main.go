@@ -14,9 +14,188 @@ import (
 	util "github.com/leviathan0992/ss5"
 )
 
+/* Connection pool configuration */
+const (
+	poolSize    = 16               /* Maximum number of idle connections in the pool */
+	poolMinIdle = 4                /* Minimum idle connections to maintain */
+	idleTimeout = 60 * time.Second /* Close idle connections after this duration */
+)
+
+type pooledConn struct {
+	conn      net.Conn
+	createdAt time.Time
+}
+
+type connPool struct {
+	mu       sync.Mutex
+	conns    []*pooledConn
+	dialFunc func() (net.Conn, error)
+	closed   bool
+}
+
+func newConnPool(dialFunc func() (net.Conn, error)) *connPool {
+	p := &connPool{
+		conns:    make([]*pooledConn, 0, poolSize),
+		dialFunc: dialFunc,
+	}
+
+	/* Start the pool maintenance goroutine. */
+	go p.maintain()
+
+	/* Pre-warm the pool with some connections. */
+	go p.warmUp()
+
+	return p
+}
+
+/* Pre-create some connections to reduce latency for initial requests. */
+func (p *connPool) warmUp() {
+	for i := 0; i < poolMinIdle; i++ {
+		conn, err := p.dialFunc()
+		if err != nil {
+			log.Printf("Failed to pre-warm connection: %v", err)
+			continue
+		}
+
+		p.mu.Lock()
+		if !p.closed && len(p.conns) < poolSize {
+			p.conns = append(p.conns, &pooledConn{
+				conn:      conn,
+				createdAt: time.Now(),
+			})
+		} else {
+			conn.Close()
+		}
+		p.mu.Unlock()
+	}
+}
+
+/* Periodically clean up stale connections and ensure minimum idle connections. */
+func (p *connPool) maintain() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
+
+		now := time.Now()
+		/* Remove stale connections. Keep at least poolMinIdle. */
+		newConns := make([]*pooledConn, 0, len(p.conns))
+		for _, pc := range p.conns {
+			if now.Sub(pc.createdAt) > idleTimeout && len(newConns) >= poolMinIdle {
+				pc.conn.Close()
+			} else {
+				newConns = append(newConns, pc)
+			}
+		}
+		p.conns = newConns
+		currentLen := len(p.conns)
+		p.mu.Unlock()
+
+		/* Replenish the pool if below minimum. */
+		if currentLen < poolMinIdle {
+			for i := currentLen; i < poolMinIdle; i++ {
+				conn, err := p.dialFunc()
+				if err != nil {
+					continue
+				}
+				p.mu.Lock()
+				if !p.closed && len(p.conns) < poolSize {
+					p.conns = append(p.conns, &pooledConn{
+						conn:      conn,
+						createdAt: time.Now(),
+					})
+				} else {
+					conn.Close()
+				}
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+
+/* Retrieve a connection from the pool or create a new one. */
+func (p *connPool) get() (net.Conn, error) {
+	p.mu.Lock()
+
+	/* Try to get an existing connection. */
+	for len(p.conns) > 0 {
+		/* Pop from the end (LIFO). */
+		pc := p.conns[len(p.conns)-1]
+		p.conns = p.conns[:len(p.conns)-1]
+		p.mu.Unlock()
+
+		/* Check if the connection is still valid. */
+		if time.Since(pc.createdAt) < idleTimeout {
+			/* Quick health check to detect closed connection. */
+			pc.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+			buf := make([]byte, 1)
+			_, err := pc.conn.Read(buf)
+			pc.conn.SetReadDeadline(time.Time{})
+
+			/* EOF or connection reset means the connection is dead. */
+			if err != nil && err.Error() != "i/o timeout" && !isTimeoutError(err) {
+				pc.conn.Close()
+				p.mu.Lock()
+				continue
+			}
+
+			return pc.conn, nil
+		}
+
+		pc.conn.Close()
+		p.mu.Lock()
+	}
+
+	p.mu.Unlock()
+
+	/* No valid connection in pool. Create a new one. */
+	return p.dialFunc()
+}
+
+/* Return a connection to the pool if it is still usable. */
+func (p *connPool) put(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed || len(p.conns) >= poolSize {
+		conn.Close()
+		return
+	}
+
+	p.conns = append(p.conns, &pooledConn{
+		conn:      conn,
+		createdAt: time.Now(),
+	})
+}
+
+/* Close all connections in the pool. */
+func (p *connPool) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.closed = true
+	for _, pc := range p.conns {
+		pc.conn.Close()
+	}
+	p.conns = nil
+}
+
+func isTimeoutError(err error) bool {
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	return false
+}
+
 type client struct {
 	*util.Service
 	clientTLSConfig *tls.Config
+	pool            *connPool
 }
 
 func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY string) *client {
@@ -61,14 +240,21 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
-	return &client{
-		&util.Service{
+	c := &client{
+		Service: &util.Service{
 			ListenAddr:   listenAddr,
 			ServerAdders: proxyAdders,
 			StableServer: proxyAdders[0],
 		},
-		TLSconfig,
+		clientTLSConfig: TLSconfig,
 	}
+
+	/* Initialize the connection pool. */
+	c.pool = newConnPool(func() (net.Conn, error) {
+		return c.DialSrv(c.clientTLSConfig)
+	})
+
+	return c
 }
 
 func (c *client) Listen() error {
@@ -110,55 +296,14 @@ func (c *client) Listen() error {
 	}
 }
 
-var (
-	srvPool    = make(chan net.Conn, 32)
-	poolClosed bool
-	poolMutex  sync.Mutex
-)
-
-func init() {
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			poolMutex.Lock()
-			if poolClosed {
-				poolMutex.Unlock()
-				return
-			}
-			poolMutex.Unlock()
-
-			for len(srvPool) > 8 {
-				select {
-				case conn := <-srvPool:
-					_ = conn.Close()
-				default:
-					return
-				}
-			}
-		}
-	}()
-}
-
-func (c *client) getConn() (net.Conn, error) {
-	select {
-	case conn := <-srvPool:
-		return conn, nil
-	default:
-		return c.DialSrv(c.clientTLSConfig)
-	}
-}
-
-
-
 func (c *client) connectServer(userConn *net.TCPConn) {
-	srvConn, err := c.getConn()
+	srvConn, err := c.pool.get()
 	if err != nil {
 		log.Printf("Failed to get server connection: %v", err)
 		return
 	}
 
+	/* SOCKS5 connections are stateful. Once used, we cannot reuse it for another request. */
 	defer srvConn.Close()
 
 	var wg sync.WaitGroup
