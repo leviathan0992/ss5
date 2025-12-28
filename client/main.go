@@ -253,7 +253,7 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		MinVersion:         tls.VersionTLS12,
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            clientCertPool,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: false, /* Enable certificate verification to prevent MITM attacks. */
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
