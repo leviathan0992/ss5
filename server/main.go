@@ -10,8 +10,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	util "github.com/leviathan0992/ss5"
@@ -42,7 +45,7 @@ func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) 
 			return 0, false
 		}
 
-		buf[offset] = 0x01 /* IPv4 address type. */
+		buf[offset] = util.AtypIPv4 /* IPv4 address type. */
 		offset++
 		copy(buf[offset:], ip4)
 		offset += len(ip4)
@@ -58,7 +61,7 @@ func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) 
 			return 0, false
 		}
 
-		buf[offset] = 0x04 /* IPv6 address type. */
+		buf[offset] = util.AtypIPv6 /* IPv6 address type. */
 		offset++
 		copy(buf[offset:], ip6)
 		offset += len(ip6)
@@ -99,14 +102,12 @@ func (s *server) ListenTLS() error {
 	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKEY)
 	if err != nil {
 		log.Println("The server failed to read and parses public/private key pairs from the file.")
-
 		return err
 	}
 
 	certBytes, err := os.ReadFile(s.clientPEM)
 	if err != nil {
 		log.Println("The server failed to read the client's PEM file.")
-
 		return err
 	}
 
@@ -129,17 +130,29 @@ func (s *server) ListenTLS() error {
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
 	if err != nil {
 		log.Printf("Failed to start the server listening on %s.", s.ListenAddr.String())
-
 		return err
-	} else {
-		log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
 	}
+	log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
 
-	defer listener.Close()
+	/* Setup graceful shutdown using atomic flag to avoid race condition. */
+	var closing atomic.Bool
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, closing...")
+		closing.Store(true)
+		listener.Close()
+	}()
 
 	for {
 		cliConn, err := listener.Accept()
 		if err != nil {
+			/* Check if we're shutting down. */
+			if closing.Load() {
+				return nil
+			}
 			continue
 		}
 
@@ -159,7 +172,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 	}
 
 	switch cmd {
-	case 0x01:
+	case util.CmdConnect:
 		/* The CONNECT command. */
 		dstAddr := addr.(*net.TCPAddr)
 
@@ -184,10 +197,10 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		var resp []byte
 		if ip4 := dstAddr.IP.To4(); ip4 != nil {
 			/* IPv4. */
-			resp = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 		} else {
 			/* IPv6. */
-			resp = []byte{0x05, 0x00, 0x00, 0x04}
+			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv6}
 			resp = append(resp, make([]byte, 16)...)
 			resp = append(resp, 0x00, 0x00)
 		}
@@ -205,8 +218,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		go func() {
 			defer wg.Done()
 
-			/* TLS -> TCP: Use splice-optimized transfer. */
-			if err := s.SpliceTransferToTCP(cliConn, dstConn); err != nil {
+			/* TLS -> TCP: Standard transfer (Splice offers no benefit for TLS). */
+			if err := s.TransferToTCP(cliConn, dstConn); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 
@@ -216,8 +229,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		go func() {
 			defer wg.Done()
 
-			/* TCP -> TLS: Use splice-optimized transfer. */
-			if err := s.SpliceTransferToTLS(dstConn, cliConn); err != nil {
+			/* TCP -> TLS: Standard transfer. */
+			if err := s.TransferToTLS(dstConn, cliConn); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 		}()
@@ -226,7 +239,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 
 		return
 
-	case 0x03:
+	case util.CmdUDPAssociate:
 		/* The UDP ASSOCIATE command. */
 		s.handleUDPAssociate(cliConn)
 
@@ -239,7 +252,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	udpConn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		log.Println("The server failed to listen on UDP.")
-
 		return
 	}
 	defer udpConn.Close()
@@ -247,168 +259,190 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	/* Preparing the response address for the client. */
 	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
 	ip := udpAddr.IP.To4()
-	addressType := byte(0x01) /* IPv4. */
+	addressType := byte(util.AtypIPv4) /* IPv4. */
 	if ip == nil {
 		ip = udpAddr.IP
-		addressType = 0x04 /* IPv6. */
+		addressType = util.AtypIPv6 /* IPv6. */
 	}
 
 	port := make([]byte, 2)
 	binary.BigEndian.PutUint16(port, uint16(udpAddr.Port))
 
-	resp := []byte{0x05, 0x00, 0x00, addressType}
+	resp := []byte{util.SocksVersion, 0x00, 0x00, addressType}
 	resp = append(resp, ip...)
 	resp = append(resp, port...)
 
 	errWrite := s.TLSWrite(cliConn, resp)
 	if errWrite != nil {
 		log.Println("The server failed to respond to the client after the UDP associate.")
-
 		return
 	}
 
-	buf := util.GetUDPBuffer()
-	defer util.PutUDPBuffer(buf)
+	/*
+	 * RFC 1928: The UDP association terminates when the TCP connection that
+	 * the UDP ASSOCIATE request arrived on terminates.
+	 * Monitor the TCP control connection and close UDP when it drops.
+	 */
+	go func() {
+		buf := make([]byte, 1)
+		/* Set deadline to prevent goroutine leak if connection never closes. */
+		_ = cliConn.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		/* This Read will return error when TCP connection closes or deadline exceeded. */
+		_, _ = cliConn.Read(buf)
+		udpConn.Close()
+	}()
 
-	respBuf := util.GetUDPBuffer()
-	defer util.PutUDPBuffer(respBuf)
-
-	packetBuf := util.GetUDPBuffer()
-	defer util.PutUDPBuffer(packetBuf)
+	/* Use a semaphore to limit concurrent UDP handlers. */
+	const maxConcurrentUDP = 64
+	sem := make(chan struct{}, maxConcurrentUDP)
+	var wg sync.WaitGroup
 
 	for {
+		buf := util.GetUDPBuffer()
+
 		/* Forwarding UDP packets. */
 		n, srcAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
+			util.PutUDPBuffer(buf)
+			/* Wait for all ongoing handlers to finish before returning. */
+			wg.Wait()
 			return
 		}
 
 		/* The minimal packet length: 3 bytes RSV/FRAG, 1 byte ATYP, 4 bytes IPv4, 2 bytes port. */
 		if n < (3 + 1 + 4 + 2) {
+			util.PutUDPBuffer(buf)
 			continue
 		}
 
 		if buf[2] != 0x00 {
 			/* Fragmentation is unsupported. */
+			util.PutUDPBuffer(buf)
 			continue
 		}
 
-		addressType := buf[3]
-		var dstAddr *net.UDPAddr
-		var headerLen int
-
-		if addressType == 0x01 { /* IPv4. */
-			if n < 10 {
-				continue
-			}
-
-			ip := make(net.IP, net.IPv4len)
-			copy(ip, buf[4:4+net.IPv4len])
-			port := int(binary.BigEndian.Uint16(buf[8:10]))
-
-			dstAddr = &net.UDPAddr{IP: ip, Port: port}
-			headerLen = 10
-		} else if addressType == 0x03 { /* The domain name. */
-			hostLen := int(buf[4])
-			if 5+hostLen+2 > n {
-				continue
-			}
-
-			host := string(buf[5 : 5+hostLen])
-			port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
-
-			addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
-			if err != nil || addr == nil || addr.IP == nil {
-				continue
-			}
-
-			dstAddr = addr
-			headerLen = 5 + hostLen + 2
-		} else if addressType == 0x04 { /* IPv6. */
-			if n < 22 {
-				continue
-			}
-
-			ip := make(net.IP, net.IPv6len)
-			copy(ip, buf[4:4+net.IPv6len])
-			port := int(binary.BigEndian.Uint16(buf[20:22]))
-
-			dstAddr = &net.UDPAddr{IP: ip, Port: port}
-			headerLen = 22
-		} else { /* Unknown address type. */
-			continue
-		}
-
-		payload := buf[headerLen:n]
-
-		if dstAddr == nil {
-			continue
-		}
-
-		dstConn, err := net.DialUDP("udp", nil, dstAddr)
-		if err != nil {
-			continue
-		}
-
-		if _, err := dstConn.Write(payload); err != nil {
-			_ = dstConn.Close()
-
-			continue
-		}
-
-		_ = dstConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-		nRead, err := dstConn.Read(respBuf)
-		_ = dstConn.Close()
-		if err != nil {
-			continue
-		}
-
-		total, ok := buildUDPResponse(dstAddr, respBuf[:nRead], packetBuf)
-		if !ok {
-			continue
-		}
-
-		_, _ = udpConn.WriteToUDP(packetBuf[:total], srcAddr)
+		/* Handle UDP packet concurrently. */
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(buf []byte, n int, srcAddr *net.UDPAddr) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			defer util.PutUDPBuffer(buf)
+			s.handleUDPPacket(udpConn, buf, n, srcAddr)
+		}(buf, n, srcAddr)
 	}
 }
 
+/* handleUDPPacket processes a single UDP packet. */
+func (s *server) handleUDPPacket(udpConn *net.UDPConn, buf []byte, n int, srcAddr *net.UDPAddr) {
+	addressType := buf[3]
+	var dstAddr *net.UDPAddr
+	var headerLen int
+
+	if addressType == util.AtypIPv4 { /* IPv4. */
+		if n < 10 {
+			return
+		}
+
+		ip := make(net.IP, net.IPv4len)
+		copy(ip, buf[4:4+net.IPv4len])
+		port := int(binary.BigEndian.Uint16(buf[8:10]))
+
+		dstAddr = &net.UDPAddr{IP: ip, Port: port}
+		headerLen = 10
+	} else if addressType == util.AtypDomain { /* The domain name. */
+		hostLen := int(buf[4])
+		if 5+hostLen+2 > n {
+			return
+		}
+
+		host := string(buf[5 : 5+hostLen])
+		port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
+
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil || addr == nil || addr.IP == nil {
+			return
+		}
+
+		dstAddr = addr
+		headerLen = 5 + hostLen + 2
+	} else if addressType == util.AtypIPv6 { /* IPv6. */
+		if n < 22 {
+			return
+		}
+
+		ip := make(net.IP, net.IPv6len)
+		copy(ip, buf[4:4+net.IPv6len])
+		port := int(binary.BigEndian.Uint16(buf[20:22]))
+
+		dstAddr = &net.UDPAddr{IP: ip, Port: port}
+		headerLen = 22
+	} else { /* Unknown address type. */
+		return
+	}
+
+	payload := buf[headerLen:n]
+
+	if dstAddr == nil {
+		return
+	}
+
+	dstConn, err := net.DialUDP("udp", nil, dstAddr)
+	if err != nil {
+		return
+	}
+	defer dstConn.Close()
+
+	if _, err := dstConn.Write(payload); err != nil {
+		return
+	}
+
+	_ = dstConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	respBuf := util.GetUDPBuffer()
+	defer util.PutUDPBuffer(respBuf)
+
+	nRead, err := dstConn.Read(respBuf)
+	if err != nil {
+		return
+	}
+
+	packetBuf := util.GetUDPBuffer()
+	defer util.PutUDPBuffer(packetBuf)
+
+	total, ok := buildUDPResponse(dstAddr, respBuf[:nRead], packetBuf)
+	if !ok {
+		return
+	}
+
+	_, _ = udpConn.WriteToUDP(packetBuf[:total], srcAddr)
+}
+
+type Config struct {
+	ServerPEM  string `json:"server_pem"`
+	ServerKey  string `json:"server_key"`
+	ClientPEM  string `json:"client_pem"`
+	ListenAddr string `json:"listen_addr"`
+}
+
 func main() {
-	var conf string
-	var config map[string]interface{}
-	flag.StringVar(&conf, "c", ".ss5-server.json", "The server configuration file.")
+	var confPath string
+	flag.StringVar(&confPath, "c", ".ss5-server.json", "The server configuration file.")
 	flag.Parse()
 
-	bytes, err := os.ReadFile(conf)
+	bytes, err := os.ReadFile(confPath)
 	if err != nil {
-		log.Fatalf("The server failed to read the configuration file.")
+		log.Fatalf("The server failed to read the configuration file: %v", err)
 	}
 
+	var config Config
 	if err := json.Unmarshal(bytes, &config); err != nil {
-		log.Fatalf("The server failed to parse the configuration file: %s .", conf)
+		log.Fatalf("The server failed to parse the configuration file %s: %v", confPath, err)
 	}
 
-	serverPEM, ok := config["server_pem"].(string)
-	if !ok {
-		log.Fatalf("Invalid server_pem in configuration file")
-	}
-
-	serverKEY, ok := config["server_key"].(string)
-	if !ok {
-		log.Fatalf("Invalid server_key in configuration file")
-	}
-
-	clientPEM, ok := config["client_pem"].(string)
-	if !ok {
-		log.Fatalf("Invalid client_pem in configuration file")
-	}
-
-	listenAddr, ok := config["listen_addr"].(string)
-	if !ok {
-		log.Fatalf("Invalid listen_addr in configuration file")
-	}
-
-	s := NewServer(listenAddr, serverPEM, serverKEY, clientPEM)
+	s := NewServer(config.ListenAddr, config.ServerPEM, config.ServerKey, config.ClientPEM)
 	if s == nil {
 		log.Fatalf("Failed to create server")
 	}

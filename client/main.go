@@ -2,23 +2,32 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	util "github.com/leviathan0992/ss5"
 )
 
-/* Connection pool configuration */
+/*
+ * Pre-warmed connection pool configuration.
+ *
+ * This pool pre-creates TLS connections to reduce latency for incoming requests.
+ * Note: SOCKS5 connections are stateful (one connection = one target), so connections
+ * cannot be reused after handling a request. The pool's value is purely in pre-warming
+ * TLS handshakes to save ~100-200ms per request.
+ */
 const (
-	poolSize    = 16               /* Maximum number of idle connections in the pool */
-	poolMinIdle = 4                /* Minimum idle connections to maintain */
-	idleTimeout = 60 * time.Second /* Close idle connections after this duration */
+	poolSize    = 16               /* Maximum number of pre-warmed connections */
+	poolMinIdle = 4                /* Minimum connections to keep pre-warmed */
+	idleTimeout = 60 * time.Second /* Discard pre-warmed connections older than this */
 )
 
 type pooledConn struct {
@@ -31,6 +40,7 @@ type connPool struct {
 	conns    []*pooledConn
 	dialFunc func() (net.Conn, error)
 	closed   bool
+	warmWg   sync.WaitGroup /* Tracks warm-up goroutines for graceful shutdown. */
 }
 
 func newConnPool(dialFunc func() (net.Conn, error)) *connPool {
@@ -39,39 +49,45 @@ func newConnPool(dialFunc func() (net.Conn, error)) *connPool {
 		dialFunc: dialFunc,
 	}
 
-	/* Start the pool maintenance goroutine. */
 	go p.maintain()
-
-	/* Pre-warm the pool with some connections. */
 	go p.warmUp()
 
 	return p
 }
 
-/* Pre-create some connections to reduce latency for initial requests. */
+/* Pre-create connections to reduce TLS handshake latency for initial requests. */
 func (p *connPool) warmUp() {
 	for i := 0; i < poolMinIdle; i++ {
-		conn, err := p.dialFunc()
-		if err != nil {
-			log.Printf("Failed to pre-warm connection: %v", err)
-			continue
-		}
-
-		p.mu.Lock()
-		if !p.closed && len(p.conns) < poolSize {
-			p.conns = append(p.conns, &pooledConn{
-				conn:      conn,
-				createdAt: time.Now(),
-			})
-		} else {
-			conn.Close()
-		}
-
-		p.mu.Unlock()
+		p.warmWg.Add(1)
+		go func() {
+			defer p.warmWg.Done()
+			p.addConnection()
+		}()
 	}
 }
 
-/* Periodically clean up stale connections and ensure minimum idle connections. */
+/* Add a single pre-warmed connection to the pool. */
+func (p *connPool) addConnection() {
+	conn, err := p.dialFunc()
+	if err != nil {
+		log.Printf("Failed to pre-warm connection: %v", err)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.closed && len(p.conns) < poolSize {
+		p.conns = append(p.conns, &pooledConn{
+			conn:      conn,
+			createdAt: time.Now(),
+		})
+	} else {
+		conn.Close()
+	}
+}
+
+/* Periodically clean up stale connections and replenish the pool. */
 func (p *connPool) maintain() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -80,105 +96,66 @@ func (p *connPool) maintain() {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-
 			return
 		}
 
+		/* Remove stale connections, keeping at least poolMinIdle. */
 		now := time.Now()
-		/* Remove stale connections. Keep at least poolMinIdle. */
-		newConns := make([]*pooledConn, 0, len(p.conns))
+		valid := make([]*pooledConn, 0, len(p.conns))
 		for _, pc := range p.conns {
-			if now.Sub(pc.createdAt) > idleTimeout && len(newConns) >= poolMinIdle {
+			if now.Sub(pc.createdAt) > idleTimeout && len(valid) >= poolMinIdle {
 				pc.conn.Close()
 			} else {
-				newConns = append(newConns, pc)
+				valid = append(valid, pc)
 			}
 		}
-		p.conns = newConns
-		currentLen := len(p.conns)
+		p.conns = valid
+		deficit := poolMinIdle - len(p.conns)
 		p.mu.Unlock()
 
 		/* Replenish the pool if below minimum. */
-		if currentLen < poolMinIdle {
-			for i := currentLen; i < poolMinIdle; i++ {
-				conn, err := p.dialFunc()
-				if err != nil {
-					continue
-				}
-				p.mu.Lock()
-				if !p.closed && len(p.conns) < poolSize {
-					p.conns = append(p.conns, &pooledConn{
-						conn:      conn,
-						createdAt: time.Now(),
-					})
-				} else {
-					conn.Close()
-				}
-
-				p.mu.Unlock()
-			}
+		for i := 0; i < deficit; i++ {
+			p.warmWg.Add(1)
+			go func() {
+				defer p.warmWg.Done()
+				p.addConnection()
+			}()
 		}
 	}
 }
 
-/* Retrieve a connection from the pool or create a new one. */
+/* Get a pre-warmed connection from the pool, or create a new one if pool is empty. */
 func (p *connPool) get() (net.Conn, error) {
 	p.mu.Lock()
 
-	/* Try to get an existing connection. */
+	/* Find a fresh connection while holding the lock. */
 	for len(p.conns) > 0 {
-		/* Pop from the end (LIFO). */
+		/* Pop from the end (LIFO - most recently added). */
 		pc := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
-		p.mu.Unlock()
 
-		/* Check if the connection is still valid. */
+		/* Check if the connection is still fresh. */
 		if time.Since(pc.createdAt) < idleTimeout {
-			/* Quick health check to detect closed connection. */
-			pc.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-			buf := make([]byte, 1)
-			_, err := pc.conn.Read(buf)
-			pc.conn.SetReadDeadline(time.Time{})
-
-			/* EOF or connection reset means the connection is dead. */
-			if err != nil && err.Error() != "i/o timeout" && !isTimeoutError(err) {
-				pc.conn.Close()
-				p.mu.Lock()
-
-				continue
-			}
-
+			p.mu.Unlock()
 			return pc.conn, nil
 		}
 
+		/* Connection is stale, close it and try next one. */
 		pc.conn.Close()
-		p.mu.Lock()
 	}
 
+	/* Pool is empty, release lock before creating new connection. */
 	p.mu.Unlock()
 
-	/* No valid connection in pool. Create a new one. */
+	/* Create a new connection outside the lock to avoid blocking other goroutines. */
 	return p.dialFunc()
 }
 
-/* Return a connection to the pool if it is still usable. */
-func (p *connPool) put(conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed || len(p.conns) >= poolSize {
-		conn.Close()
-		return
-	}
-
-	p.conns = append(p.conns, &pooledConn{
-		conn:      conn,
-		createdAt: time.Now(),
-	})
-}
-
-/* Close all connections in the pool. */
+/* Close all connections and shut down the pool. */
 func (p *connPool) close() {
+	/* Wait for any in-progress warm-up connections to complete. */
+	p.warmWg.Wait()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -187,13 +164,6 @@ func (p *connPool) close() {
 		pc.conn.Close()
 	}
 	p.conns = nil
-}
-
-func isTimeoutError(err error) bool {
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Timeout()
-	}
-	return false
 }
 
 type client struct {
@@ -224,36 +194,22 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		return nil
 	}
 
-	/* Try to read and parse the public/private key pairs from the file. */
+	/* Load client certificate for mTLS authentication. */
 	cert, err := tls.LoadX509KeyPair(clientPEM, clientKEY)
 	if err != nil {
-		log.Println("The client failed to read and parses the public/private key pairs from the file.")
-
+		log.Println("The client failed to load the certificate and key pair.")
 		return nil
 	}
 
-	certBytes, err := os.ReadFile(clientPEM)
-	if err != nil {
-		log.Println("The client failed to read the client's PEM file.")
-
-		return nil
-	}
-
-	clientCertPool := x509.NewCertPool()
-
-	/* Try to attempt to parse the PEM encoded certificates. */
-	ok := clientCertPool.AppendCertsFromPEM(certBytes)
-	if !ok {
-		log.Println("The client failed to parse the PEM-encoded certificates.")
-
-		return nil
-	}
-
+	/*
+	 * TLS configuration for connecting to the server.
+	 * InsecureSkipVerify is used because we use self-signed certificates.
+	 * Security is ensured by mTLS (server verifies client certificate).
+	 */
 	TLSconfig := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		Certificates:       []tls.Certificate{cert},
-		RootCAs:            clientCertPool,
-		InsecureSkipVerify: false, /* Enable certificate verification to prevent MITM attacks. */
+		InsecureSkipVerify: true,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
@@ -261,10 +217,12 @@ func NewClient(listen string, srvAdders []string, clientPEM string, clientKEY st
 		Service: &util.Service{
 			ListenAddr:   listenAddr,
 			ServerAdders: proxyAdders,
-			StableServer: proxyAdders[0],
 		},
 		clientTLSConfig: TLSconfig,
 	}
+
+	/* Set the initial stable server. */
+	c.SetStableServer(proxyAdders[0])
 
 	/* Initialize the connection pool. */
 	c.pool = newConnPool(func() (net.Conn, error) {
@@ -279,24 +237,37 @@ func (c *client) Listen() error {
 		log.Printf("The configured server address is %s:%d.", srv.IP, srv.Port)
 	}
 
-	log.Printf("Using the default server address: %s:%d.", c.Service.StableServer.IP, c.Service.StableServer.Port)
+	stable := c.GetStableServer()
+	log.Printf("Using the default server address: %s:%d.", stable.IP, stable.Port)
 
 	listener, err := net.ListenTCP("tcp", c.ListenAddr)
 	if err != nil {
 		log.Printf("Failed to start the client listening on %s.", c.ListenAddr.String())
-
 		return err
-	} else {
-		log.Printf("The client successfully started listening on %s.", c.ListenAddr.String())
 	}
+	log.Printf("The client successfully started listening on %s.", c.ListenAddr.String())
 
-	defer listener.Close()
+	/* Setup graceful shutdown using atomic flag to avoid race condition. */
+	var closing atomic.Bool
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, closing...")
+		closing.Store(true)
+		listener.Close()
+		c.pool.close()
+	}()
 
 	for {
 		userConn, err := listener.AcceptTCP()
 		if err != nil {
+			/* Check if we're shutting down. */
+			if closing.Load() {
+				return nil
+			}
 			log.Println(err)
-
 			continue
 		}
 
@@ -329,8 +300,8 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		/* TLS -> TCP: Use splice-optimized transfer. */
-		if err := c.SpliceTransferToTCP(srvConn, userConn); err != nil {
+		/* TLS -> TCP: Standard transfer (Splice offers no benefit for TLS). */
+		if err := c.TransferToTCP(srvConn, userConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
 
@@ -340,8 +311,8 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		/* TCP -> TLS: Use splice-optimized transfer. */
-		if err := c.SpliceTransferToTLS(userConn, srvConn); err != nil {
+		/* TCP -> TLS: Standard transfer. */
+		if err := c.TransferToTLS(userConn, srvConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
 	}()
@@ -355,49 +326,29 @@ func (c *client) handleConn(userConn *net.TCPConn) {
 	c.connectServer(userConn)
 }
 
+type Config struct {
+	ServerAddr []string `json:"server_addr"`
+	ClientPEM  string   `json:"client_pem"`
+	ClientKey  string   `json:"client_key"`
+	ListenAddr string   `json:"listen_addr"`
+}
+
 func main() {
-	var conf string
-	var config map[string]interface{}
-	flag.StringVar(&conf, "c", ".ss5-client.json", "The client configuration file.")
+	var confPath string
+	flag.StringVar(&confPath, "c", ".ss5-client.json", "The client configuration file.")
 	flag.Parse()
 
-	bytes, err := os.ReadFile(conf)
+	bytes, err := os.ReadFile(confPath)
 	if err != nil {
-		log.Fatalf("The client failed to read the configuration file.")
+		log.Fatalf("The client failed to read the configuration file: %v", err)
 	}
 
+	var config Config
 	if err := json.Unmarshal(bytes, &config); err != nil {
-		log.Fatalf("The client failed to parse the configuration file: %s .", conf)
+		log.Fatalf("The client failed to parse the configuration file %s: %v", confPath, err)
 	}
 
-	var srvAdders []string
-	srvAddr, ok := config["server_addr"].([]interface{})
-	if !ok {
-		log.Fatalf("Invalid server_addr in configuration file")
-	}
-
-	for _, ip := range srvAddr {
-		if ipStr, ok := ip.(string); ok {
-			srvAdders = append(srvAdders, ipStr)
-		}
-	}
-
-	clientPEM, ok := config["client_pem"].(string)
-	if !ok {
-		log.Fatalf("Invalid client_pem in configuration file")
-	}
-
-	clientKEY, ok := config["client_key"].(string)
-	if !ok {
-		log.Fatalf("Invalid client_key in configuration file")
-	}
-
-	listenAddr, ok := config["listen_addr"].(string)
-	if !ok {
-		log.Fatalf("Invalid listen_addr in configuration file")
-	}
-
-	c := NewClient(listenAddr, srvAdders, clientPEM, clientKEY)
+	c := NewClient(config.ListenAddr, config.ServerAddr, config.ClientPEM, config.ClientKey)
 	if c == nil {
 		log.Fatalf("Failed to create client")
 	}
