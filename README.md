@@ -22,11 +22,11 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.0.3/ss5_0.0.3_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.0/ss5_0.1.0_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.0.3_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.0_Linux_x86_64.tar.gz
    
-   cd ss5_0.0.3_Linux_x86_64
+   cd ss5_0.1.0_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:
