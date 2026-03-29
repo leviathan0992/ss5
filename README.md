@@ -41,7 +41,8 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
     ],
     "listen_addr": "127.0.0.1:2024",
     "client_pem": "/etc/client.pem",
-    "client_key": "/etc/client.key"
+    "client_key": "/etc/client.key",
+    "server_pem": "/etc/server.pem"
     }
    ```
 
@@ -70,4 +71,3 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
 ## License:
 
 Apache-2.0 license
-

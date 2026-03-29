@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -11,7 +12,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -119,12 +119,10 @@ func (s *server) ListenTLS() error {
 	}
 
 	serverTLSConfig := &tls.Config{
-		MinVersion:             tls.VersionTLS12,
-		Certificates:           []tls.Certificate{cert},
-		ClientAuth:             tls.RequireAndVerifyClientCert,
-		ClientCAs:              clientCertPool,
-		SessionTicketsDisabled: false,
-		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCertPool,
 	}
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
@@ -164,46 +162,60 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 	defer cliConn.Close()
 
 	/* Parsing the SOCKS5 over TLS connection. */
+	_ = cliConn.SetDeadline(time.Now().Add(30 * time.Second))
 	addr, cmd, err := s.ParseSOCKS5FromTLS(cliConn)
 	if err != nil {
 		log.Printf("The server failed to parse the SOCKS5 protocol: %s.", err.Error())
 
 		return
 	}
+	_ = cliConn.SetDeadline(time.Time{})
 
 	switch cmd {
 	case util.CmdConnect:
 		/* The CONNECT command. */
 		dstAddr := addr.(*net.TCPAddr)
 
-		/* Attempting to connect to the destination address. */
-		dstConn, err := net.DialTCP("tcp", nil, dstAddr)
+		/* Attempting to connect to the destination address with a 30s timeout. */
+		d := &net.Dialer{Timeout: 30 * time.Second}
+		dstConn, err := d.Dial("tcp", dstAddr.String())
 		if err != nil {
 			log.Printf("The server failed to connect to the destination address %s.", dstAddr.String())
-
+			/* Inform the client that the connection failed (0x05 = connection refused). */
+			util.SendSOCKS5Reply(cliConn, 0x05)
 			return
 		}
-		defer dstConn.Close()
+		tcpDst, ok := dstConn.(*net.TCPConn)
+		if !ok {
+			dstConn.Close()
+			util.SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
+			return
+		}
+		defer tcpDst.Close()
 		log.Printf("The server connects to the destination address %s successful.", dstAddr.String())
 
-		_ = dstConn.SetKeepAlive(true)
-		_ = dstConn.SetKeepAlivePeriod(30 * time.Second)
-		_ = dstConn.SetLinger(0)
-		_ = dstConn.SetNoDelay(true)
-		_ = dstConn.SetReadBuffer(128 * 1024)
-		_ = dstConn.SetWriteBuffer(128 * 1024)
+		_ = tcpDst.SetKeepAlive(true)
+		_ = tcpDst.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpDst.SetLinger(0)
+		_ = tcpDst.SetNoDelay(true)
+		_ = tcpDst.SetReadBuffer(128 * 1024)
+		_ = tcpDst.SetWriteBuffer(128 * 1024)
 
 		/* Connection to the destination address successful, responding to the client. */
+		boundAddr := tcpDst.LocalAddr().(*net.TCPAddr)
 		var resp []byte
-		if ip4 := dstAddr.IP.To4(); ip4 != nil {
+		if ip4 := boundAddr.IP.To4(); ip4 != nil {
 			/* IPv4. */
-			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv4}
+			resp = append(resp, ip4...)
 		} else {
 			/* IPv6. */
 			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv6}
-			resp = append(resp, make([]byte, 16)...)
-			resp = append(resp, 0x00, 0x00)
+			resp = append(resp, boundAddr.IP.To16()...)
 		}
+		port := make([]byte, 2)
+		binary.BigEndian.PutUint16(port, uint16(boundAddr.Port))
+		resp = append(resp, port...)
 
 		errWrite := s.TLSWrite(cliConn, resp)
 		if errWrite != nil {
@@ -219,18 +231,18 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 			defer wg.Done()
 
 			/* TLS -> TCP: Standard transfer (Splice offers no benefit for TLS). */
-			if err := s.TransferToTCP(cliConn, dstConn); err != nil {
+			if err := s.TransferToTCP(cliConn, tcpDst); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 
-			_ = dstConn.CloseWrite()
+			_ = tcpDst.CloseWrite()
 		}()
 
 		go func() {
 			defer wg.Done()
 
 			/* TCP -> TLS: Standard transfer. */
-			if err := s.TransferToTLS(dstConn, cliConn); err != nil {
+			if err := s.TransferToTLS(tcpDst, cliConn); err != nil {
 				log.Printf("The connection closed: %v", err)
 			}
 		}()
@@ -248,8 +260,21 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 }
 
 func (s *server) handleUDPAssociate(cliConn net.Conn) {
-	/* Start listening for UDP connections. */
-	udpConn, err := net.ListenUDP("udp", nil)
+	/*
+	 * Use the actual local address of the TCP control connection so the UDP
+	 * association is advertised on the same interface the client reached.
+	 */
+	advertiseIP := s.ListenAddr.IP
+	if localTCP, ok := cliConn.LocalAddr().(*net.TCPAddr); ok && localTCP.IP != nil && !localTCP.IP.IsUnspecified() {
+		advertiseIP = localTCP.IP
+	}
+	if advertiseIP == nil || advertiseIP.IsUnspecified() {
+		log.Println("The server failed to determine the UDP advertise address.")
+		return
+	}
+
+	/* Bind UDP to the same IP we will advertise. */
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: advertiseIP, Port: 0})
 	if err != nil {
 		log.Println("The server failed to listen on UDP.")
 		return
@@ -285,9 +310,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	 */
 	go func() {
 		buf := make([]byte, 1)
-		/* Set deadline to prevent goroutine leak if connection never closes. */
-		_ = cliConn.SetReadDeadline(time.Now().Add(10 * time.Minute))
-		/* This Read will return error when TCP connection closes or deadline exceeded. */
 		_, _ = cliConn.Read(buf)
 		udpConn.Close()
 	}()
@@ -296,6 +318,13 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	const maxConcurrentUDP = 64
 	sem := make(chan struct{}, maxConcurrentUDP)
 	var wg sync.WaitGroup
+	var allowedSrc *net.UDPAddr
+
+	tcpRemote, ok := cliConn.RemoteAddr().(*net.TCPAddr)
+	if !ok || tcpRemote.IP == nil {
+		log.Println("The server failed to determine the UDP association client address.")
+		return
+	}
 
 	for {
 		buf := util.GetUDPBuffer()
@@ -317,6 +346,25 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 
 		if buf[2] != 0x00 {
 			/* Fragmentation is unsupported. */
+			util.PutUDPBuffer(buf)
+			continue
+		}
+
+		/*
+		 * Tie the UDP association to the TCP control connection's client IP.
+		 * After the first accepted UDP datagram, pin the full UDP source tuple.
+		 */
+		if !srcAddr.IP.Equal(tcpRemote.IP) {
+			util.PutUDPBuffer(buf)
+			continue
+		}
+		if allowedSrc == nil {
+			allowedSrc = &net.UDPAddr{
+				IP:   append(net.IP(nil), srcAddr.IP...),
+				Port: srcAddr.Port,
+				Zone: srcAddr.Zone,
+			}
+		} else if !srcAddr.IP.Equal(allowedSrc.IP) || srcAddr.Port != allowedSrc.Port || srcAddr.Zone != allowedSrc.Zone {
 			util.PutUDPBuffer(buf)
 			continue
 		}
@@ -361,12 +409,20 @@ func (s *server) handleUDPPacket(udpConn *net.UDPConn, buf []byte, n int, srcAdd
 		host := string(buf[5 : 5+hostLen])
 		port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
 
-		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
-		if err != nil || addr == nil || addr.IP == nil {
+		/* Use a context with timeout to prevent blocking the semaphore slot on slow DNS. */
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		ips, err := net.DefaultResolver.LookupHost(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return
+		}
+		ip := net.ParseIP(ips[0])
+		if ip == nil {
 			return
 		}
 
-		dstAddr = addr
+		dstAddr = &net.UDPAddr{IP: ip, Port: port}
 		headerLen = 5 + hostLen + 2
 	} else if addressType == util.AtypIPv6 { /* IPv6. */
 		if n < 22 {
@@ -385,10 +441,6 @@ func (s *server) handleUDPPacket(udpConn *net.UDPConn, buf []byte, n int, srcAdd
 
 	payload := buf[headerLen:n]
 
-	if dstAddr == nil {
-		return
-	}
-
 	dstConn, err := net.DialUDP("udp", nil, dstAddr)
 	if err != nil {
 		return
@@ -399,25 +451,28 @@ func (s *server) handleUDPPacket(udpConn *net.UDPConn, buf []byte, n int, srcAdd
 		return
 	}
 
-	_ = dstConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
 	respBuf := util.GetUDPBuffer()
 	defer util.PutUDPBuffer(respBuf)
-
-	nRead, err := dstConn.Read(respBuf)
-	if err != nil {
-		return
-	}
 
 	packetBuf := util.GetUDPBuffer()
 	defer util.PutUDPBuffer(packetBuf)
 
-	total, ok := buildUDPResponse(dstAddr, respBuf[:nRead], packetBuf)
-	if !ok {
-		return
-	}
+	for {
+		_ = dstConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		nRead, err := dstConn.Read(respBuf)
+		if err != nil {
+			return
+		}
 
-	_, _ = udpConn.WriteToUDP(packetBuf[:total], srcAddr)
+		total, ok := buildUDPResponse(dstAddr, respBuf[:nRead], packetBuf)
+		if !ok {
+			return
+		}
+
+		if _, err := udpConn.WriteToUDP(packetBuf[:total], srcAddr); err != nil {
+			return
+		}
+	}
 }
 
 type Config struct {
