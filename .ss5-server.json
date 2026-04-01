@@ -1,5 +1,6 @@
 {
   "listen_addr": "0.0.0.0:443",
+  "public_addr": "",
   "server_key": "/etc/server.key",
   "server_pem": "/etc/server.pem",
   "client_pem": "/etc/client.pem"

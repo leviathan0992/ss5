@@ -20,10 +20,11 @@ archives:
     # Defaults to `default`.
     id: my-archive
 
-    format: tar.gz
+    formats:
+      - tar.gz
 
-    # Builds reference which build instances should be archived in this archive.
-    builds:
+    # IDs reference which build instances should be archived in this archive.
+    ids:
       - ss5-server
       - ss5-client
 
@@ -55,7 +56,8 @@ archives:
     # Default is empty.
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
 
     # Additional files/template/globs you want to add to the archive.
     # Defaults are any files matching `LICENSE*`, `README*`, `CHANGELOG*`,

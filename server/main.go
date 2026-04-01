@@ -621,18 +621,30 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 	if assoc == nil {
 		return
 	}
+	if n < 4 {
+		return
+	}
+	if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
+		return
+	}
 	addressType := buf[3]
 	var dstAddr *net.UDPAddr
 	var headerLen int
 
 	switch addressType {
 	case util.AtypIPv4:
+		if n < 10 {
+			return
+		}
 		ip := make(net.IP, net.IPv4len)
 		copy(ip, buf[4:4+net.IPv4len])
 		dstAddr = &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(buf[8:10]))}
 		headerLen = 10
 
 	case util.AtypDomain:
+		if n < 5 {
+			return
+		}
 		hostLen := int(buf[4])
 		if 5+hostLen+2 > n {
 			return
