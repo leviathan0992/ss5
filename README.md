@@ -2,11 +2,15 @@
 
 A Golang Implementation of SOCKS5 over TLS.
 
-This project provides a Golang implementation of a SOCKS5 over TLS proxy system, including client and server components.
-The client runs locally to convert regular SOCKS5 requests into encrypted TLS requests and forwards them to the remote
-server. The server receives and decrypts these requests for further processing.
+This project provides a Golang implementation of a SOCKS5 over TLS proxy
+system, including client and server components. The client runs locally to
+convert regular SOCKS5 requests into encrypted TLS requests and forwards them
+to the remote server. The server receives and decrypts these requests for
+further processing.
 
-Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
+Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands. The
+server keeps per-target UDP relay sockets within each UDP association so
+stateful UDP protocols can retain a stable upstream tuple.
 
 ```
  --------------                              --------------
@@ -22,11 +26,11 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.0/ss5_0.1.0_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.1/ss5_0.1.1_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.0_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.1_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.0_Linux_x86_64
+   cd ss5_0.1.1_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:
@@ -58,11 +62,19 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands.
    
    {
     "listen_addr": "0.0.0.0:443",
+    "public_addr": "",
     "server_key": "/etc/server.key",
     "server_pem": "/etc/server.pem",
     "client_pem": "/etc/client.pem"
     }
    ```
+
+   `public_addr` is optional, but it is recommended when the server runs
+   behind NAT, an Elastic IP, a cloud private network, or any other topology
+   where the server's local interface address is not directly reachable by the
+   client. In those environments, set it to the public IP or hostname clients
+   actually use to reach the server.
+
 5. Start the ss5-server:
    ```shell
    ./ss5-server -c .ss5-server.json

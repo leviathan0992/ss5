@@ -1,29 +1,28 @@
+/* Provides the shared SOCKS5-over-TLS proxy primitives used by both binaries. */
 package ss5
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-/* The buffer (64KB) is used after successful authentication between the connections. */
+/* Stores the buffer size used to relay TCP data. */
 const ConnectionBuffer = 64 * 1024
 
-/* The buffer (64KB) is used for relaying UDP payloads. */
+/* Stores the buffer size used to relay UDP payloads. */
 const UDPBuffer = 64 * 1024
 
-/* The buffer (8KB) is used for parsing SOCKS5. */
+/* Stores the buffer size used to parse SOCKS5 handshakes. */
 const Socks5Buffer = 8 * 1024
 
-/* SOCKS5 Protocol Constants */
+/* Defines SOCKS5 protocol constants. */
 const (
 	SocksVersion    = 0x05
 	CmdConnect      = 0x01
@@ -33,7 +32,7 @@ const (
 	AtypIPv6        = 0x04
 )
 
-/* Strongly-typed buffer pool wrappers to eliminate type assertion overhead. */
+/* Reuses fixed-size buffers without repeated allocations. */
 type bufferPool struct {
 	pool sync.Pool
 	size int
@@ -43,22 +42,24 @@ func newBufferPool(size int) *bufferPool {
 	return &bufferPool{
 		pool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, size)
+				b := make([]byte, size)
+				return &b
 			},
 		},
 		size: size,
 	}
 }
 
-/* sync.Pool.Get never returns nil when New is set, so no nil check needed. */
+/* Pulls one buffer from the pool. */
 func (p *bufferPool) Get() []byte {
-	return p.pool.Get().([]byte)
+	return *p.pool.Get().(*[]byte)
 }
 
 func (p *bufferPool) Put(buf []byte) {
-	/* Only return buffers of the correct size to avoid memory bloat. */
+	/* Only return buffers of the correct size to avoid memory bloat.
+	 * Store *[]byte (pointer-sized) so sync.Pool can hold it without allocation. */
 	if len(buf) == p.size {
-		p.pool.Put(buf)
+		p.pool.Put(&buf)
 	}
 }
 
@@ -66,74 +67,80 @@ var bytePool = newBufferPool(ConnectionBuffer)
 var udpPool = newBufferPool(UDPBuffer)
 var socks5Pool = newBufferPool(Socks5Buffer)
 
+/* Holds the shared configuration embedded by both the client and server. */
 type Service struct {
-	ListenAddr   *net.TCPAddr
-	ServerAddrs  []*net.TCPAddr
-	stableServer atomic.Pointer[net.TCPAddr]
+	ListenAddr *net.TCPAddr
 }
 
-/* GetStableServer returns the current stable server address (thread-safe). */
-func (s *Service) GetStableServer() *net.TCPAddr {
-	return s.stableServer.Load()
+/* Preserves a SOCKS5 domain-form destination without resolving it prematurely. */
+type socksAddr struct {
+	network string
+	host    string
+	port    int
 }
 
-/* SetStableServer updates the stable server address (thread-safe). */
-func (s *Service) SetStableServer(addr *net.TCPAddr) {
-	s.stableServer.Store(addr)
+func (a *socksAddr) Network() string {
+	return a.network
+}
+
+func (a *socksAddr) String() string {
+	if a == nil {
+		return ""
+	}
+	return net.JoinHostPort(a.host, strconv.Itoa(a.port))
 }
 
 func writeAll(conn net.Conn, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
+		buf = buf[n:]
 		if err != nil {
 			return err
 		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		buf = buf[n:]
 	}
 	return nil
 }
 
-func (s *Service) TLSWrite(conn net.Conn, buf []byte) error {
+/* Writes the full buffer to the connection, retrying until completion or failure. */
+func (s *Service) Write(conn net.Conn, buf []byte) error {
 	return writeAll(conn, buf)
 }
 
-/* SendSOCKS5Reply sends a SOCKS5 reply with the given reply code. */
+/* Sends a SOCKS5 reply with the given reply code. */
 func SendSOCKS5Reply(conn net.Conn, rep byte) {
 	reply := []byte{SocksVersion, rep, 0x00, AtypIPv4, 0, 0, 0, 0, 0, 0}
 	_ = writeAll(conn, reply)
 }
 
-func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
+/* Copies data from src to dst while refreshing idle deadlines. */
+func copyConn(src, dst net.Conn) error {
 	buf := bytePool.Get()
 	defer bytePool.Put(buf)
 
 	/* Set initial deadline before the first read to guard against an immediate stall. */
 	const idleTimeout = 5 * time.Minute
 	const deadlineInterval = 30 * time.Second
-	_ = srcConn.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = dstConn.SetWriteDeadline(time.Now().Add(idleTimeout))
+	_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 	lastDeadlineUpdate := time.Now()
 
 	for {
 		/* Refresh deadline less frequently to reduce syscall overhead. */
 		if time.Since(lastDeadlineUpdate) > deadlineInterval {
-			_ = srcConn.SetReadDeadline(time.Now().Add(idleTimeout))
-			_ = dstConn.SetWriteDeadline(time.Now().Add(idleTimeout))
+			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+			_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			lastDeadlineUpdate = time.Now()
 		}
 
-		n, err := srcConn.Read(buf)
+		n, err := src.Read(buf)
 		if n > 0 {
-			if wErr := writeAll(dstConn, buf[:n]); wErr != nil {
+			if wErr := writeAll(dst, buf[:n]); wErr != nil {
 				return wErr
 			}
 		}
 
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -141,38 +148,12 @@ func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 	}
 }
 
+func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
+	return copyConn(srcConn, dstConn)
+}
+
 func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
-	buf := bytePool.Get()
-	defer bytePool.Put(buf)
-
-	/* Set initial deadline before the first read to guard against an immediate stall. */
-	const idleTimeout = 5 * time.Minute
-	const deadlineInterval = 30 * time.Second
-	_ = dstConn.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = srcConn.SetWriteDeadline(time.Now().Add(idleTimeout))
-	lastDeadlineUpdate := time.Now()
-
-	for {
-		if time.Since(lastDeadlineUpdate) > deadlineInterval {
-			_ = dstConn.SetReadDeadline(time.Now().Add(idleTimeout))
-			_ = srcConn.SetWriteDeadline(time.Now().Add(idleTimeout))
-			lastDeadlineUpdate = time.Now()
-		}
-
-		n, err := dstConn.Read(buf)
-		if n > 0 {
-			if wErr := writeAll(srcConn, buf[:n]); wErr != nil {
-				return wErr
-			}
-		}
-
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-	}
+	return copyConn(dstConn, srcConn)
 }
 
 func GetUDPBuffer() []byte {
@@ -195,7 +176,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 
 	/* Verify SOCKS5 version (0x05). */
 	if buf[0] != SocksVersion {
-		return nil, 0x00, errors.New("currently only supporting the SOCKS5 protocol")
+		return nil, 0x00, fmt.Errorf("unsupported SOCKS version in greeting: 0x%02x", buf[0])
 	}
 
 	nMethods := int(buf[1])
@@ -212,14 +193,14 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		}
 	}
 	if !hasNoAuth {
-		if err := s.TLSWrite(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
+		if err := s.Write(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to reject unsupported SOCKS5 methods: %w", err)
 		}
 		return nil, 0x00, errors.New("client does not offer SOCKS5 no-authentication method")
 	}
 
 	/* Reply: SOCKS5, no authentication required. */
-	if err := s.TLSWrite(cliConn, []byte{SocksVersion, 0x00}); err != nil {
+	if err := s.Write(cliConn, []byte{SocksVersion, 0x00}); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to respond to SOCKS5 greeting: %w", err)
 	}
 
@@ -227,6 +208,11 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	/* Read header up to ATYP (4 bytes). */
 	if _, err := io.ReadFull(cliConn, buf[:4]); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 request header: %w", err)
+	}
+
+	if buf[0] != SocksVersion {
+		SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
+		return nil, 0x00, fmt.Errorf("unsupported SOCKS5 version in request: 0x%02x", buf[0])
 	}
 
 	cmd := buf[1]
@@ -238,6 +224,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 
 	var dstIP []byte
 	var portBytes []byte
+	var domain string
 
 	switch buf[3] {
 	case AtypIPv4: /* IPv4: 4 bytes. */
@@ -261,24 +248,24 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 			return nil, 0x00, fmt.Errorf("failed to read domain and port: %w", err)
 		}
 
-		domain := string(buf[:domainLen])
+		domain = string(buf[:domainLen])
 		portBytes = buf[domainLen : domainLen+2]
 
-		/* Use context with timeout for DNS resolution. */
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		resolver := net.Resolver{}
-		ips, err := resolver.LookupIPAddr(ctx, domain)
-		if err != nil {
+		ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+		if err != nil || len(ipAddrs) == 0 {
 			SendSOCKS5Reply(cliConn, 0x04) /* 0x04 = host unreachable */
-			return nil, 0x00, fmt.Errorf("failed to resolve domain %s: %w", domain, err)
+			if err != nil {
+				return nil, 0x00, fmt.Errorf("failed to resolve domain %q: %w", domain, err)
+			}
+			return nil, 0x00, fmt.Errorf("failed to resolve domain %q", domain)
 		}
-		if len(ips) == 0 {
-			SendSOCKS5Reply(cliConn, 0x04) /* 0x04 = host unreachable */
-			return nil, 0x00, fmt.Errorf("domain %s resolved to no IP addresses", domain)
-		}
-		dstIP = ips[0].IP
+
+		resolvedIP := make(net.IP, len(ipAddrs[0].IP))
+		copy(resolvedIP, ipAddrs[0].IP)
+		dstIP = resolvedIP
 
 	case AtypIPv6: /* IPv6: 16 bytes. */
 		if _, err := io.ReadFull(cliConn, buf[:16+2]); err != nil {
@@ -305,47 +292,4 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	}
 
 	return dstAddr, cmd, nil
-}
-
-func (s *Service) DialSrv(conf *tls.Config) (net.Conn, error) {
-	dial := func(addr string) (net.Conn, error) {
-		tlsConf := conf.Clone()
-		if tlsConf.ServerName == "" {
-			host, _, err := net.SplitHostPort(addr)
-			if err == nil {
-				tlsConf.ServerName = host
-			}
-		}
-		d := &net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-		return tls.DialWithDialer(d, "tcp", addr, tlsConf)
-	}
-
-	/* Try the stable server first. */
-	stable := s.GetStableServer()
-	srvConn, err := dial(stable.String())
-	if err != nil {
-		log.Printf("Failed to connect to server %s: %s", stable.String(), err)
-
-		/* Fallback: try other servers in order, skipping the already-failed stable. */
-		for _, srv := range s.ServerAddrs {
-			if srv.String() == stable.String() {
-				continue
-			}
-			log.Printf("Trying alternate server: %s", srv.String())
-
-			srvConn, err = dial(srv.String())
-			if err == nil {
-				s.SetStableServer(srv)
-				return srvConn, nil
-			}
-		}
-
-		return nil, errors.New("all server connection attempts failed")
-	}
-
-	log.Printf("Connected to server %s", stable.String())
-	return srvConn, nil
 }

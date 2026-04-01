@@ -81,23 +81,20 @@ func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY str
 		return nil
 	}
 
-	TLSconfig := &tls.Config{
+	tlsConfig := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            serverCertPool,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
-	c := &client{
+	return &client{
 		Service: &util.Service{
 			ListenAddr: listenAddr,
 		},
-		clientTLSConfig: TLSconfig,
+		clientTLSConfig: tlsConfig,
 		upstreams:       upstreams,
 	}
-	c.stableIndex.Store(0)
-
-	return c
 }
 
 func (c *client) dialServer() (net.Conn, error) {
@@ -143,7 +140,12 @@ func (c *client) Listen() error {
 		log.Printf("The configured server address is %s.", srv.label)
 	}
 
-	stable := c.upstreams[c.stableIndex.Load()]
+	stableIdx := int(c.stableIndex.Load())
+	if stableIdx >= len(c.upstreams) {
+		stableIdx = 0
+		c.stableIndex.Store(0)
+	}
+	stable := c.upstreams[stableIdx]
 	log.Printf("Using the default server address: %s.", stable.label)
 
 	listener, err := net.ListenTCP("tcp", c.ListenAddr)
@@ -210,7 +212,10 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 			log.Printf("The connection closed: %v", err)
 		}
 
+		/* Signal the user that we are done sending, then unblock
+		 * the other goroutine which is reading from the server. */
 		_ = userConn.CloseWrite()
+		srvConn.Close()
 	}()
 
 	go func() {
@@ -220,6 +225,9 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 		if err := c.TransferToTLS(userConn, srvConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
+
+		/* Unblock the other goroutine which is reading from srvConn. */
+		_ = userConn.CloseRead()
 	}()
 
 	wg.Wait()
