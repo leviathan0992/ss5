@@ -34,6 +34,7 @@ type udpAssociation struct {
 	clientAddr *net.UDPAddr
 
 	mu     sync.Mutex
+	closed bool
 	relays map[string]*udpRelay
 	wg     sync.WaitGroup
 }
@@ -50,6 +51,9 @@ const udpAssociationIdleTimeout = 5 * time.Minute
 
 /* Encodes a SOCKS5 UDP reply header and payload into buf for dst. */
 func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) {
+	if dst == nil || dst.IP == nil {
+		return 0, false
+	}
 	/* Ensuring the buffer can hold the fixed 3-byte reserved header. */
 	if len(buf) < 3 {
 		return 0, false
@@ -126,6 +130,9 @@ func udpPublicAddrFor(localIP net.IP, port int) *net.UDPAddr {
 }
 
 func newUDPAssociation(clientConn *net.UDPConn, clientAddr *net.UDPAddr) *udpAssociation {
+	if clientConn == nil || clientAddr == nil {
+		return nil
+	}
 	return &udpAssociation{
 		clientConn: clientConn,
 		clientAddr: cloneUDPAddr(clientAddr),
@@ -134,12 +141,19 @@ func newUDPAssociation(clientConn *net.UDPConn, clientAddr *net.UDPAddr) *udpAss
 }
 
 func (a *udpAssociation) relayFor(dst *net.UDPAddr) (*udpRelay, error) {
-	if a == nil || dst == nil {
-		return nil, errors.New("nil udp association relay target")
+	if a == nil {
+		return nil, errors.New("nil udp association")
+	}
+	if dst == nil {
+		return nil, errors.New("nil relay target address")
 	}
 	key := dst.String()
 
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil, errors.New("udp association closed")
+	}
 	if relay, ok := a.relays[key]; ok {
 		a.mu.Unlock()
 		return relay, nil
@@ -161,6 +175,11 @@ func (a *udpAssociation) relayFor(dst *net.UDPAddr) (*udpRelay, error) {
 	}
 
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		conn.Close()
+		return nil, errors.New("udp association closed")
+	}
 	if existing, ok := a.relays[key]; ok {
 		/* Another goroutine raced and created a relay for this target first. */
 		a.mu.Unlock()
@@ -176,6 +195,9 @@ func (a *udpAssociation) relayFor(dst *net.UDPAddr) (*udpRelay, error) {
 }
 
 func (a *udpAssociation) removeRelay(key string, relay *udpRelay) {
+	if a == nil {
+		return
+	}
 	a.mu.Lock()
 	if current, ok := a.relays[key]; ok && current == relay {
 		delete(a.relays, key)
@@ -188,6 +210,7 @@ func (a *udpAssociation) Close() {
 		return
 	}
 	a.mu.Lock()
+	a.closed = true
 	relays := make([]*udpRelay, 0, len(a.relays))
 	for _, relay := range a.relays {
 		relays = append(relays, relay)
@@ -213,6 +236,9 @@ func (r *udpRelay) close() {
 }
 
 func (r *udpRelay) readLoop() {
+	if r.assoc == nil {
+		return
+	}
 	defer r.assoc.wg.Done()
 	respBuf := util.GetUDPBuffer()
 	defer util.PutUDPBuffer(respBuf)
@@ -249,16 +275,21 @@ func resolvePublicIP(publicAddr string) (net.IP, error) {
 	if host, _, err := net.SplitHostPort(value); err == nil {
 		value = strings.TrimSpace(host)
 	}
+	if value == "" {
+		return nil, nil
+	}
 	if ip := net.ParseIP(value); ip != nil {
 		return append(net.IP(nil), ip...), nil
 	}
-	resolved, err := net.LookupIP(value)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, value)
 	if err != nil {
 		return nil, err
 	}
-	for _, ip := range resolved {
-		if ip != nil {
-			return append(net.IP(nil), ip...), nil
+	for _, ipAddr := range resolved {
+		if ipAddr.IP != nil {
+			return append(net.IP(nil), ipAddr.IP...), nil
 		}
 	}
 	return nil, errors.New("no ip address found")
@@ -277,13 +308,13 @@ func NewServer(listenAddr string, publicAddr string, serverPEM string, serverKEY
 	}
 
 	return &server{
-		&util.Service{
+		Service: &util.Service{
 			ListenAddr: tcpAddr,
 		},
-		publicIP,
-		serverPEM,
-		serverKEY,
-		clientPEM,
+		publicIP:  publicIP,
+		serverPEM: serverPEM,
+		serverKEY: serverKEY,
+		clientPEM: clientPEM,
 	}
 }
 
@@ -293,21 +324,21 @@ func (s *server) ListenTLS() error {
 		log.Printf("The server's public UDP address is %s.", s.publicIP.String())
 	}
 
-	/* Try to read and parse public/private key pairs from the file. */
+	/* Load TLS certificate and private key. */
 	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKEY)
 	if err != nil {
-		log.Println("The server failed to read and parses public/private key pairs from the file.")
+		log.Printf("The server failed to load the TLS key pair: %v", err)
 		return err
 	}
 
 	certBytes, err := os.ReadFile(s.clientPEM)
 	if err != nil {
-		log.Println("The server failed to read the client's PEM file.")
+		log.Printf("The server failed to read the client's PEM file: %v", err)
 		return err
 	}
 
 	clientCertPool := x509.NewCertPool()
-	/* Try to attempt to parse the PEM encoded certificates. */
+	/* Attempt to parse the PEM encoded certificates. */
 	ok := clientCertPool.AppendCertsFromPEM(certBytes)
 	if !ok {
 		return errors.New("failed to parse PEM-encoded client certificates")
@@ -322,7 +353,7 @@ func (s *server) ListenTLS() error {
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
 	if err != nil {
-		log.Printf("Failed to start the server listening on %s.", s.ListenAddr.String())
+		log.Printf("Failed to start the server listening on %s: %v", s.ListenAddr.String(), err)
 		return err
 	}
 	log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
@@ -334,10 +365,14 @@ func (s *server) ListenTLS() error {
 
 	go func() {
 		<-sigChan
+		signal.Stop(sigChan)
 		log.Println("Received shutdown signal, closing...")
 		closing.Store(true)
 		listener.Close()
 	}()
+
+	const maxConnections = 4096
+	connSem := make(chan struct{}, maxConnections)
 
 	for {
 		cliConn, err := listener.Accept()
@@ -346,11 +381,39 @@ func (s *server) ListenTLS() error {
 			if closing.Load() {
 				return nil
 			}
+			log.Printf("Failed to accept TLS connection: %v", err)
 			continue
 		}
 
-		go s.handleTLSConn(cliConn)
+		select {
+		case connSem <- struct{}{}:
+			go func() {
+				defer func() { <-connSem }()
+				s.handleTLSConn(cliConn)
+			}()
+		default:
+			log.Println("Connection limit reached, dropping connection")
+			cliConn.Close()
+		}
 	}
+}
+
+/* Maps a dial error to the appropriate SOCKS5 reply code per RFC 1928. */
+func dialErrToSOCKS5Code(err error) byte {
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return 0x05 /* connection refused */
+	}
+	if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL) {
+		return 0x03 /* network unreachable */
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EHOSTDOWN) || errors.Is(err, syscall.ETIMEDOUT) {
+		return 0x04 /* host unreachable */
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return 0x04 /* host unreachable (timeout) */
+	}
+	return 0x01 /* general SOCKS server failure */
 }
 
 func (s *server) handleTLSConn(cliConn net.Conn) {
@@ -360,8 +423,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 	_ = cliConn.SetDeadline(time.Now().Add(30 * time.Second))
 	addr, cmd, err := s.ParseSOCKS5FromTLS(cliConn)
 	if err != nil {
-		log.Printf("The server failed to parse the SOCKS5 protocol: %s.", err.Error())
-
+		log.Printf("The server failed to parse the SOCKS5 protocol: %v", err)
 		return
 	}
 	_ = cliConn.SetDeadline(time.Time{})
@@ -375,9 +437,8 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		d := &net.Dialer{Timeout: 30 * time.Second}
 		dstConn, err := d.Dial("tcp", targetAddr)
 		if err != nil {
-			log.Printf("The server failed to connect to the destination address %s.", targetAddr)
-			/* Inform the client that the connection failed (0x05 = connection refused). */
-			util.SendSOCKS5Reply(cliConn, 0x05)
+			log.Printf("The server failed to connect to the destination address %s: %v", targetAddr, err)
+			util.SendSOCKS5Reply(cliConn, dialErrToSOCKS5Code(err))
 			return
 		}
 		tcpDst, ok := dstConn.(*net.TCPConn)
@@ -387,7 +448,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 			return
 		}
 		defer tcpDst.Close()
-		log.Printf("The server connects to the destination address %s successful.", targetAddr)
+		log.Printf("The server connected to the destination address %s successfully.", targetAddr)
 
 		_ = tcpDst.SetKeepAlive(true)
 		_ = tcpDst.SetKeepAlivePeriod(30 * time.Second)
@@ -397,7 +458,11 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		_ = tcpDst.SetWriteBuffer(128 * 1024)
 
 		/* Connection to the destination address successful, responding to the client. */
-		boundAddr := tcpDst.LocalAddr().(*net.TCPAddr)
+		boundAddr, ok := tcpDst.LocalAddr().(*net.TCPAddr)
+		if !ok {
+			util.SendSOCKS5Reply(cliConn, 0x01)
+			return
+		}
 		var resp []byte
 		if ip4 := boundAddr.IP.To4(); ip4 != nil {
 			/* IPv4. */
@@ -405,17 +470,21 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 			resp = append(resp, ip4...)
 		} else {
 			/* IPv6. */
+			ip6 := boundAddr.IP.To16()
+			if ip6 == nil {
+				util.SendSOCKS5Reply(cliConn, 0x01)
+				return
+			}
 			resp = []byte{util.SocksVersion, 0x00, 0x00, util.AtypIPv6}
-			resp = append(resp, boundAddr.IP.To16()...)
+			resp = append(resp, ip6...)
 		}
 		var port [2]byte
 		binary.BigEndian.PutUint16(port[:], uint16(boundAddr.Port))
 		resp = append(resp, port[:]...)
 
-		errWrite := s.Write(cliConn, resp)
+		errWrite := util.WriteAll(cliConn, resp)
 		if errWrite != nil {
-			log.Println("The server successfully connected to the destination address, but failed to respond to the client.")
-
+			log.Printf("The server connected to the destination, but failed to respond to the client: %v", errWrite)
 			return
 		}
 
@@ -432,7 +501,9 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 
 			/* Signal the destination that we are done sending while keeping
 			 * the read side open so the peer can finish replying. */
-			_ = tcpDst.CloseWrite()
+			if cwErr := tcpDst.CloseWrite(); cwErr != nil {
+				log.Printf("CloseWrite to destination failed: %v", cwErr)
+			}
 		}()
 
 		go func() {
@@ -443,26 +514,34 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 				log.Printf("The connection closed: %v", err)
 			}
 
-			/* Unblock the other goroutine which is reading from cliConn. */
-			cliConn.Close()
+			/* Unblock the other goroutine which is reading from cliConn.
+			 * Use SetReadDeadline instead of Close to avoid double-close with
+			 * the deferred cliConn.Close() in handleTLSConn. */
+			_ = cliConn.SetReadDeadline(time.Now())
 		}()
 
 		wg.Wait()
-
-		return
 
 	case util.CmdUDPAssociate:
 		/* The UDP ASSOCIATE command. */
 		s.handleUDPAssociate(cliConn)
 
-		return
+	default:
+		log.Printf("Unexpected SOCKS5 command after parse: 0x%02x", cmd)
+		util.SendSOCKS5Reply(cliConn, 0x07)
 	}
 }
 
 func (s *server) handleUDPAssociate(cliConn net.Conn) {
-	if s == nil {
+	/* Validate the TCP control connection's remote address before committing
+	 * to any response so we can send a proper error reply if the check fails. */
+	tcpRemote, ok := cliConn.RemoteAddr().(*net.TCPAddr)
+	if !ok || tcpRemote.IP == nil {
+		log.Println("The server failed to determine the UDP association client address.")
+		util.SendSOCKS5Reply(cliConn, 0x01)
 		return
 	}
+
 	/*
 	 * Use the actual local address of the TCP control connection so the UDP
 	 * association uses the same interface the client reached unless a public
@@ -479,6 +558,7 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	}
 	if publicIP == nil || publicIP.IsUnspecified() {
 		log.Println("The server failed to determine the public UDP address.")
+		util.SendSOCKS5Reply(cliConn, 0x01)
 		return
 	}
 
@@ -489,19 +569,37 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	 */
 	udpConn, err := net.ListenUDP("udp", udpWildcardAddrFor(publicIP))
 	if err != nil {
-		log.Println("The server failed to listen on UDP.")
+		log.Printf("The server failed to listen on UDP: %v", err)
+		util.SendSOCKS5Reply(cliConn, 0x01)
 		return
 	}
-	defer udpConn.Close()
+	var udpCloseOnce sync.Once
+	closeUDP := func() { udpCloseOnce.Do(func() { udpConn.Close() }) }
+	defer closeUDP()
 
 	/* Preparing the public response address for the client. */
-	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	udpAddr, ok := udpConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		log.Println("The server failed to get the UDP local address.")
+		util.SendSOCKS5Reply(cliConn, 0x01)
+		return
+	}
 	publicAddr := udpPublicAddrFor(publicIP, udpAddr.Port)
+	if publicAddr.IP == nil {
+		log.Println("The server failed to determine a valid public IP for UDP response.")
+		util.SendSOCKS5Reply(cliConn, 0x01)
+		return
+	}
 	ip := publicAddr.IP.To4()
 	addressType := byte(util.AtypIPv4) /* IPv4. */
 	if ip == nil {
-		ip = publicAddr.IP
+		ip = publicAddr.IP.To16()
 		addressType = util.AtypIPv6 /* IPv6. */
+	}
+	if ip == nil {
+		log.Println("The server failed to normalize public IP for UDP response.")
+		util.SendSOCKS5Reply(cliConn, 0x01)
+		return
 	}
 
 	var port [2]byte
@@ -511,9 +609,9 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	resp = append(resp, ip...)
 	resp = append(resp, port[:]...)
 
-	errWrite := s.Write(cliConn, resp)
+	errWrite := util.WriteAll(cliConn, resp)
 	if errWrite != nil {
-		log.Println("The server failed to respond to the client after the UDP associate.")
+		log.Printf("The server failed to respond to the client after the UDP associate: %v", errWrite)
 		return
 	}
 
@@ -523,9 +621,9 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	 * Monitor the TCP control connection and close UDP when it drops.
 	 */
 	go func() {
-		buf := make([]byte, 1)
-		_, _ = cliConn.Read(buf)
-		udpConn.Close()
+		var buf [1]byte
+		_, _ = cliConn.Read(buf[:])
+		closeUDP()
 	}()
 
 	/* Use a semaphore to limit concurrent UDP handlers. */
@@ -539,12 +637,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 			assoc.Close()
 		}
 	}()
-
-	tcpRemote, ok := cliConn.RemoteAddr().(*net.TCPAddr)
-	if !ok || tcpRemote.IP == nil {
-		log.Println("The server failed to determine the UDP association client address.")
-		return
-	}
 
 	/*
 	 * Reset the idle deadline before every read so that associations with
@@ -586,24 +678,33 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 		 * Tie the UDP association to the TCP control connection's client IP.
 		 * After the first accepted UDP datagram, pin the full UDP source tuple.
 		 */
+		if srcAddr == nil || srcAddr.IP == nil {
+			util.PutUDPBuffer(buf)
+			continue
+		}
 		if !srcAddr.IP.Equal(tcpRemote.IP) {
 			util.PutUDPBuffer(buf)
 			continue
 		}
 		if allowedSrc == nil {
-			allowedSrc = &net.UDPAddr{
-				IP:   append(net.IP(nil), srcAddr.IP...),
-				Port: srcAddr.Port,
-				Zone: srcAddr.Zone,
-			}
+			allowedSrc = cloneUDPAddr(srcAddr)
 			assoc = newUDPAssociation(udpConn, allowedSrc)
+			if assoc == nil {
+				util.PutUDPBuffer(buf)
+				continue
+			}
 		} else if !srcAddr.IP.Equal(allowedSrc.IP) || srcAddr.Port != allowedSrc.Port || srcAddr.Zone != allowedSrc.Zone {
 			util.PutUDPBuffer(buf)
 			continue
 		}
 
-		/* Handle UDP packet concurrently. */
-		sem <- struct{}{}
+		/* Handle UDP packet concurrently; drop packet if all slots are busy. */
+		select {
+		case sem <- struct{}{}:
+		default:
+			util.PutUDPBuffer(buf)
+			continue
+		}
 		wg.Add(1)
 		go func(buf []byte, n int) {
 			defer func() {
@@ -621,12 +722,8 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 	if assoc == nil {
 		return
 	}
-	if n < 4 {
-		return
-	}
-	if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
-		return
-	}
+	/* The caller validated n >= 10, RSV/FRAG == 0, and source IP authorization.
+	 * Per-type length checks below are defensive for non-IPv4 address types. */
 	addressType := buf[3]
 	var dstAddr *net.UDPAddr
 	var headerLen int
@@ -646,7 +743,7 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 			return
 		}
 		hostLen := int(buf[4])
-		if 5+hostLen+2 > n {
+		if hostLen == 0 || 5+hostLen+2 > n {
 			return
 		}
 		host := string(buf[5 : 5+hostLen])
@@ -655,14 +752,13 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		ips, err := net.DefaultResolver.LookupHost(ctx, host)
-		if err != nil || len(ips) == 0 {
+		ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(ipAddrs) == 0 {
+			log.Printf("UDP relay DNS lookup failed for %q: %v", host, err)
 			return
 		}
-		ip := net.ParseIP(ips[0])
-		if ip == nil {
-			return
-		}
+		ip := make(net.IP, len(ipAddrs[0].IP))
+		copy(ip, ipAddrs[0].IP)
 		dstAddr = &net.UDPAddr{IP: ip, Port: port}
 		headerLen = 5 + hostLen + 2
 
@@ -682,14 +778,17 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 	payload := buf[headerLen:n]
 	relay, err := assoc.relayFor(dstAddr)
 	if err != nil {
+		log.Printf("UDP relay setup failed for %s: %v", dstAddr, err)
 		return
 	}
 	if err := relay.conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		log.Printf("UDP relay set deadline failed for %s: %v", dstAddr, err)
 		assoc.removeRelay(relay.key, relay)
 		relay.close()
 		return
 	}
 	if _, err := relay.conn.Write(payload); err != nil {
+		log.Printf("UDP relay write failed for %s: %v", dstAddr, err)
 		assoc.removeRelay(relay.key, relay)
 		relay.close()
 		return
@@ -724,5 +823,7 @@ func main() {
 		log.Fatalf("Failed to create server")
 	}
 
-	s.ListenTLS()
+	if err := s.ListenTLS(); err != nil {
+		log.Fatalf("Server exited with error: %v", err)
+	}
 }

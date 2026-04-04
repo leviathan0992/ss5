@@ -111,6 +111,7 @@ func (c *client) dialServer() (net.Conn, error) {
 	stableIdx := int(c.stableIndex.Load())
 	if stableIdx >= len(c.upstreams) {
 		stableIdx = 0
+		c.stableIndex.Store(0)
 	}
 	stable := c.upstreams[stableIdx]
 	srvConn, err := dial(stable)
@@ -119,7 +120,7 @@ func (c *client) dialServer() (net.Conn, error) {
 		return srvConn, nil
 	}
 
-	log.Printf("Failed to connect to server %s: %s", stable.label, err)
+	log.Printf("Failed to connect to server %s: %v", stable.label, err)
 	for i, srv := range c.upstreams {
 		if i == stableIdx {
 			continue
@@ -150,7 +151,7 @@ func (c *client) Listen() error {
 
 	listener, err := net.ListenTCP("tcp", c.ListenAddr)
 	if err != nil {
-		log.Printf("Failed to start the client listening on %s.", c.ListenAddr.String())
+		log.Printf("Failed to start the client listening on %s: %v", c.ListenAddr.String(), err)
 		return err
 	}
 	log.Printf("The client successfully started listening on %s.", c.ListenAddr.String())
@@ -162,10 +163,14 @@ func (c *client) Listen() error {
 
 	go func() {
 		<-sigChan
+		signal.Stop(sigChan)
 		log.Println("Received shutdown signal, closing...")
 		closing.Store(true)
 		listener.Close()
 	}()
+
+	const maxConnections = 1024
+	sem := make(chan struct{}, maxConnections)
 
 	for {
 		userConn, err := listener.AcceptTCP()
@@ -174,7 +179,7 @@ func (c *client) Listen() error {
 			if closing.Load() {
 				return nil
 			}
-			log.Println(err)
+			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
 
@@ -187,7 +192,16 @@ func (c *client) Listen() error {
 		_ = userConn.SetReadBuffer(128 * 1024)
 		_ = userConn.SetWriteBuffer(128 * 1024)
 
-		go c.handleConn(userConn)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				c.handleConn(userConn)
+			}()
+		default:
+			log.Println("Connection limit reached, dropping connection")
+			userConn.Close()
+		}
 	}
 }
 
@@ -199,7 +213,9 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	}
 
 	/* SOCKS5 connections are stateful. Once used, we cannot reuse it for another request. */
-	defer srvConn.Close()
+	var srvCloseOnce sync.Once
+	closeSrv := func() { srvCloseOnce.Do(func() { srvConn.Close() }) }
+	defer closeSrv()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -212,10 +228,13 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 			log.Printf("The connection closed: %v", err)
 		}
 
-		/* Signal the user that we are done sending, then unblock
-		 * the other goroutine which is reading from the server. */
-		_ = userConn.CloseWrite()
-		srvConn.Close()
+		/* Signal the user that we are done sending. Also close the server
+		 * connection: TLS has no half-close, so this is the only way to
+		 * unblock the other goroutine if it is stalled mid-write to srvConn. */
+		if cwErr := userConn.CloseWrite(); cwErr != nil {
+			log.Printf("CloseWrite to user failed: %v", cwErr)
+		}
+		closeSrv()
 	}()
 
 	go func() {
@@ -227,7 +246,7 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 		}
 
 		/* Unblock the other goroutine which is reading from srvConn. */
-		_ = userConn.CloseRead()
+		closeSrv()
 	}()
 
 	wg.Wait()
@@ -267,5 +286,7 @@ func main() {
 		log.Fatalf("Failed to create client")
 	}
 
-	_ = c.Listen()
+	if err := c.Listen(); err != nil {
+		log.Fatalf("Client exited with error: %v", err)
+	}
 }

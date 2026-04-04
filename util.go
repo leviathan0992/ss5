@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -22,14 +21,14 @@ const UDPBuffer = 64 * 1024
 /* Stores the buffer size used to parse SOCKS5 handshakes. */
 const Socks5Buffer = 8 * 1024
 
-/* Defines SOCKS5 protocol constants. */
+/* Defines SOCKS5 protocol constants per RFC 1928. */
 const (
-	SocksVersion    = 0x05
-	CmdConnect      = 0x01
-	CmdUDPAssociate = 0x03
-	AtypIPv4        = 0x01
-	AtypDomain      = 0x03
-	AtypIPv6        = 0x04
+	SocksVersion    byte = 0x05
+	CmdConnect      byte = 0x01
+	CmdUDPAssociate byte = 0x03
+	AtypIPv4        byte = 0x01
+	AtypDomain      byte = 0x03
+	AtypIPv6        byte = 0x04
 )
 
 /* Reuses fixed-size buffers without repeated allocations. */
@@ -41,7 +40,7 @@ type bufferPool struct {
 func newBufferPool(size int) *bufferPool {
 	return &bufferPool{
 		pool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				b := make([]byte, size)
 				return &b
 			},
@@ -56,60 +55,45 @@ func (p *bufferPool) Get() []byte {
 }
 
 func (p *bufferPool) Put(buf []byte) {
-	/* Only return buffers of the correct size to avoid memory bloat.
-	 * Store *[]byte (pointer-sized) so sync.Pool can hold it without allocation. */
-	if len(buf) == p.size {
+	/* Only return buffers of the correct capacity to avoid memory bloat.
+	 * Reslice to full capacity so the next Get returns the full buffer. */
+	if cap(buf) == p.size {
+		buf = buf[:cap(buf)]
 		p.pool.Put(&buf)
 	}
 }
 
-var bytePool = newBufferPool(ConnectionBuffer)
-var udpPool = newBufferPool(UDPBuffer)
-var socks5Pool = newBufferPool(Socks5Buffer)
+var (
+	bytePool   = newBufferPool(ConnectionBuffer)
+	udpPool    = newBufferPool(UDPBuffer)
+	socks5Pool = newBufferPool(Socks5Buffer)
+)
 
 /* Holds the shared configuration embedded by both the client and server. */
 type Service struct {
 	ListenAddr *net.TCPAddr
 }
 
-/* Preserves a SOCKS5 domain-form destination without resolving it prematurely. */
-type socksAddr struct {
-	network string
-	host    string
-	port    int
-}
-
-func (a *socksAddr) Network() string {
-	return a.network
-}
-
-func (a *socksAddr) String() string {
-	if a == nil {
-		return ""
-	}
-	return net.JoinHostPort(a.host, strconv.Itoa(a.port))
-}
-
-func writeAll(conn net.Conn, buf []byte) error {
+func WriteAll(conn net.Conn, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
-		buf = buf[n:]
+		if n > 0 {
+			buf = buf[n:]
+		}
 		if err != nil {
 			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
 	return nil
 }
 
-/* Writes the full buffer to the connection, retrying until completion or failure. */
-func (s *Service) Write(conn net.Conn, buf []byte) error {
-	return writeAll(conn, buf)
-}
-
 /* Sends a SOCKS5 reply with the given reply code. */
 func SendSOCKS5Reply(conn net.Conn, rep byte) {
 	reply := []byte{SocksVersion, rep, 0x00, AtypIPv4, 0, 0, 0, 0, 0, 0}
-	_ = writeAll(conn, reply)
+	_ = WriteAll(conn, reply)
 }
 
 /* Copies data from src to dst while refreshing idle deadlines. */
@@ -134,13 +118,19 @@ func copyConn(src, dst net.Conn) error {
 
 		n, err := src.Read(buf)
 		if n > 0 {
-			if wErr := writeAll(dst, buf[:n]); wErr != nil {
+			if wErr := WriteAll(dst, buf[:n]); wErr != nil {
 				return wErr
 			}
 		}
 
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+			/* Treat timeout as clean shutdown: idle timeout and deadline-based
+			 * signaling (e.g. SetReadDeadline(time.Now())) are expected events. */
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				return nil
 			}
 			return err
@@ -152,8 +142,8 @@ func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 	return copyConn(srcConn, dstConn)
 }
 
-func (s *Service) TransferToTLS(dstConn *net.TCPConn, srcConn net.Conn) error {
-	return copyConn(dstConn, srcConn)
+func (s *Service) TransferToTLS(tcpSrc *net.TCPConn, tlsDst net.Conn) error {
+	return copyConn(tcpSrc, tlsDst)
 }
 
 func GetUDPBuffer() []byte {
@@ -180,6 +170,9 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	}
 
 	nMethods := int(buf[1])
+	if nMethods == 0 {
+		return nil, 0x00, errors.New("SOCKS5 greeting has zero methods")
+	}
 	/* Read the methods list. */
 	if _, err := io.ReadFull(cliConn, buf[:nMethods]); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 methods: %w", err)
@@ -193,14 +186,14 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		}
 	}
 	if !hasNoAuth {
-		if err := s.Write(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
+		if err := WriteAll(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to reject unsupported SOCKS5 methods: %w", err)
 		}
 		return nil, 0x00, errors.New("client does not offer SOCKS5 no-authentication method")
 	}
 
 	/* Reply: SOCKS5, no authentication required. */
-	if err := s.Write(cliConn, []byte{SocksVersion, 0x00}); err != nil {
+	if err := WriteAll(cliConn, []byte{SocksVersion, 0x00}); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to respond to SOCKS5 greeting: %w", err)
 	}
 
@@ -223,33 +216,36 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	}
 
 	var dstIP []byte
-	var portBytes []byte
-	var domain string
+	var port int
 
 	switch buf[3] {
 	case AtypIPv4: /* IPv4: 4 bytes. */
 		if _, err := io.ReadFull(cliConn, buf[:4+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read IPv4 address and port: %w", err)
 		}
-		/* Copy IP bytes: buf is a pooled slice returned after this function exits. */
+		/* Copy IP and port immediately: buf is pooled and must not be referenced after return. */
 		ip4 := make(net.IP, net.IPv4len)
 		copy(ip4, buf[:4])
 		dstIP = ip4
-		portBytes = buf[4:6]
+		port = int(binary.BigEndian.Uint16(buf[4:6]))
 
 	case AtypDomain: /* Domain name. */
 		if _, err := io.ReadFull(cliConn, buf[:1]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read domain length: %w", err)
 		}
 		domainLen := int(buf[0])
+		if domainLen == 0 {
+			SendSOCKS5Reply(cliConn, 0x01)
+			return nil, 0x00, errors.New("SOCKS5 domain address has zero length")
+		}
 
 		/* Read domain + 2 bytes port. */
 		if _, err := io.ReadFull(cliConn, buf[:domainLen+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read domain and port: %w", err)
 		}
 
-		domain = string(buf[:domainLen])
-		portBytes = buf[domainLen : domainLen+2]
+		domain := string(buf[:domainLen])
+		port = int(binary.BigEndian.Uint16(buf[domainLen : domainLen+2]))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -271,11 +267,11 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		if _, err := io.ReadFull(cliConn, buf[:16+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read IPv6 address and port: %w", err)
 		}
-		/* Copy IP bytes: buf is a pooled slice returned after this function exits. */
+		/* Copy IP and port immediately: buf is pooled and must not be referenced after return. */
 		ip6 := make(net.IP, net.IPv6len)
 		copy(ip6, buf[:16])
 		dstIP = ip6
-		portBytes = buf[16:18]
+		port = int(binary.BigEndian.Uint16(buf[16:18]))
 
 	default:
 		SendSOCKS5Reply(cliConn, 0x08) /* 0x08 = address type not supported */
@@ -283,8 +279,6 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	}
 
 	var dstAddr net.Addr
-	port := int(binary.BigEndian.Uint16(portBytes))
-
 	if cmd == CmdConnect {
 		dstAddr = &net.TCPAddr{IP: dstIP, Port: port}
 	} else {
