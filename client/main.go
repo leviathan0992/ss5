@@ -18,47 +18,44 @@ import (
 	util "github.com/leviathan0992/ss5"
 )
 
+/* Holds the address and pre-built TLS config for one upstream server.
+ * The TLS config is pre-cloned with the correct ServerName so dialServer avoids
+ * cloning it on every connection attempt. addrStr is the pre-computed string form
+ * of addr so tls.DialWithDialer never allocates it on the hot dial path. */
 type upstreamEndpoint struct {
-	addr       *net.TCPAddr
-	serverName string
-	label      string
+	addr      *net.TCPAddr
+	addrStr   string /* pre-computed addr.String(); avoids allocation per dial */
+	tlsConfig *tls.Config
+	label     string
 }
 
+/* Accepts local SOCKS5 traffic and tunnels it to one of the configured
+ * upstream servers over mutual TLS. */
 type client struct {
 	*util.Service
-	clientTLSConfig *tls.Config
-	upstreams       []upstreamEndpoint
-	stableIndex     atomic.Uint32
+	upstreams   []upstreamEndpoint
+	stableIndex atomic.Uint32
 }
 
+/* serverDialer is reused across all upstream dial attempts. net.Dialer is safe
+ * for concurrent use, so a single instance avoids one heap allocation per dial. */
+var serverDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+/* dialUpstream opens a TLS connection to a single upstream endpoint.
+ * Defined at package level so dialServer creates no closure on each call. */
+func dialUpstream(upstream upstreamEndpoint) (net.Conn, error) {
+	return tls.DialWithDialer(serverDialer, "tcp", upstream.addrStr, upstream.tlsConfig)
+}
+
+/* Constructs a client from the given configuration parameters.
+ * Returns nil and logs an error if any parameter is invalid. */
 func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY string, serverPEM string) *client {
 	listenAddr, err := net.ResolveTCPAddr("tcp", listen)
 	if err != nil {
 		log.Printf("Failed to resolve listen address %s: %v", listen, err)
-		return nil
-	}
-
-	var upstreams []upstreamEndpoint
-	for _, srvAddr := range srvAddrs {
-		addr, err := net.ResolveTCPAddr("tcp", srvAddr)
-		if err != nil {
-			log.Printf("Failed to resolve server address %s: %v", srvAddr, err)
-			continue
-		}
-		host, _, splitErr := net.SplitHostPort(srvAddr)
-		if splitErr != nil {
-			log.Printf("Failed to parse server address %s: %v", srvAddr, splitErr)
-			continue
-		}
-		upstreams = append(upstreams, upstreamEndpoint{
-			addr:       addr,
-			serverName: host,
-			label:      srvAddr,
-		})
-	}
-
-	if len(upstreams) == 0 {
-		log.Println("No valid server addresses provided")
 		return nil
 	}
 
@@ -81,40 +78,60 @@ func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY str
 		return nil
 	}
 
-	tlsConfig := &tls.Config{
+	/* Build a base TLS config that is cloned once per upstream endpoint at
+	 * construction time, avoiding a Clone() on every dial attempt. */
+	baseTLS := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            serverCertPool,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 
+	var upstreams []upstreamEndpoint
+	for _, srvAddr := range srvAddrs {
+		addr, err := net.ResolveTCPAddr("tcp", srvAddr)
+		if err != nil {
+			log.Printf("Failed to resolve server address %s: %v", srvAddr, err)
+			continue
+		}
+		host, _, splitErr := net.SplitHostPort(srvAddr)
+		if splitErr != nil {
+			log.Printf("Failed to parse server address %s: %v", srvAddr, splitErr)
+			continue
+		}
+		cfg := baseTLS.Clone()
+		cfg.ServerName = host
+		upstreams = append(upstreams, upstreamEndpoint{
+			addr:      addr,
+			addrStr:   addr.String(),
+			tlsConfig: cfg,
+			label:     srvAddr,
+		})
+	}
+
+	if len(upstreams) == 0 {
+		log.Println("No valid server addresses provided")
+		return nil
+	}
+
 	return &client{
 		Service: &util.Service{
 			ListenAddr: listenAddr,
 		},
-		clientTLSConfig: tlsConfig,
-		upstreams:       upstreams,
+		upstreams: upstreams,
 	}
 }
 
+/* Establishes a TLS connection to an upstream server, preferring the
+ * last-stable endpoint and falling back to the others on failure. */
 func (c *client) dialServer() (net.Conn, error) {
-	dial := func(upstream upstreamEndpoint) (net.Conn, error) {
-		tlsConf := c.clientTLSConfig.Clone()
-		tlsConf.ServerName = upstream.serverName
-		d := &net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-		return tls.DialWithDialer(d, "tcp", upstream.addr.String(), tlsConf)
-	}
-
 	stableIdx := int(c.stableIndex.Load())
 	if stableIdx >= len(c.upstreams) {
 		stableIdx = 0
 		c.stableIndex.Store(0)
 	}
 	stable := c.upstreams[stableIdx]
-	srvConn, err := dial(stable)
+	srvConn, err := dialUpstream(stable)
 	if err == nil {
 		log.Printf("Connected to server %s", stable.label)
 		return srvConn, nil
@@ -126,16 +143,19 @@ func (c *client) dialServer() (net.Conn, error) {
 			continue
 		}
 		log.Printf("Trying alternate server: %s", srv.label)
-		srvConn, err = dial(srv)
+		srvConn, err = dialUpstream(srv)
 		if err == nil {
 			c.stableIndex.Store(uint32(i))
 			return srvConn, nil
 		}
+		log.Printf("Failed to connect to alternate server %s: %v", srv.label, err)
 	}
 
 	return nil, fmt.Errorf("all %d upstream(s) failed; last error: %w", len(c.upstreams), err)
 }
 
+/* Accepts incoming TCP connections and dispatches each to handleConn.
+ * Returns when a shutdown signal is received. */
 func (c *client) Listen() error {
 	for _, srv := range c.upstreams {
 		log.Printf("The configured server address is %s.", srv.label)
@@ -185,8 +205,7 @@ func (c *client) Listen() error {
 
 		_ = userConn.SetKeepAlive(true)
 		_ = userConn.SetKeepAlivePeriod(30 * time.Second)
-
-		/* Discard any unsent or unacknowledged data. */
+		/* SetLinger(0) discards unacknowledged data on close for a fast reset. */
 		_ = userConn.SetLinger(0)
 		_ = userConn.SetNoDelay(true)
 		_ = userConn.SetReadBuffer(128 * 1024)
@@ -205,6 +224,8 @@ func (c *client) Listen() error {
 	}
 }
 
+/* Dials the upstream server and bidirectionally relays data
+ * between userConn and the server connection. */
 func (c *client) connectServer(userConn *net.TCPConn) {
 	srvConn, err := c.dialServer()
 	if err != nil {
@@ -212,7 +233,7 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 		return
 	}
 
-	/* SOCKS5 connections are stateful. Once used, we cannot reuse it for another request. */
+	/* SOCKS5 connections are stateful; once used a connection cannot be reused. */
 	var srvCloseOnce sync.Once
 	closeSrv := func() { srvCloseOnce.Do(func() { srvConn.Close() }) }
 	defer closeSrv()
@@ -223,7 +244,7 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		/* TLS -> TCP: Standard transfer (Splice offers no benefit for TLS). */
+		/* TLS -> TCP: Splice offers no benefit for TLS. */
 		if err := c.TransferToTCP(srvConn, userConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
@@ -240,18 +261,19 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 	go func() {
 		defer wg.Done()
 
-		/* TCP -> TLS: Standard transfer. */
+		/* TCP -> TLS. */
 		if err := c.TransferToTLS(userConn, srvConn); err != nil {
 			log.Printf("The connection closed: %v", err)
 		}
 
-		/* Unblock the other goroutine which is reading from srvConn. */
+		/* Unblock the TLS->TCP goroutine which is reading from srvConn. */
 		closeSrv()
 	}()
 
 	wg.Wait()
 }
 
+/* Handles a single incoming SOCKS5 connection from a local user. */
 func (c *client) handleConn(userConn *net.TCPConn) {
 	defer userConn.Close()
 
@@ -262,7 +284,7 @@ type Config struct {
 	ServerAddr []string `json:"server_addr"`
 	ClientPEM  string   `json:"client_pem"`
 	ClientKey  string   `json:"client_key"`
-	ServerPEM  string   `json:"server_pem"` /* Server CA cert for TLS verification. */
+	ServerPEM  string   `json:"server_pem"` /* Server CA cert for verifying the server identity. */
 	ListenAddr string   `json:"listen_addr"`
 }
 
@@ -279,6 +301,22 @@ func main() {
 	var config Config
 	if err := json.Unmarshal(bytes, &config); err != nil {
 		log.Fatalf("The client failed to parse the configuration file %s: %v", confPath, err)
+	}
+
+	if config.ListenAddr == "" {
+		log.Fatalf("Configuration field listen_addr is required")
+	}
+	if len(config.ServerAddr) == 0 {
+		log.Fatalf("Configuration field server_addr is required and must be non-empty")
+	}
+	if config.ClientPEM == "" {
+		log.Fatalf("Configuration field client_pem is required")
+	}
+	if config.ClientKey == "" {
+		log.Fatalf("Configuration field client_key is required")
+	}
+	if config.ServerPEM == "" {
+		log.Fatalf("Configuration field server_pem is required")
 	}
 
 	c := NewClient(config.ListenAddr, config.ServerAddr, config.ClientPEM, config.ClientKey, config.ServerPEM)

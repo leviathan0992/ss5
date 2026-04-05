@@ -1,7 +1,9 @@
-/* Provides the shared SOCKS5-over-TLS proxy primitives used by both binaries. */
+/* Package ss5 provides the shared SOCKS5-over-TLS proxy primitives
+ * used by both the client and server binaries. */
 package ss5
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -12,16 +14,16 @@ import (
 	"time"
 )
 
-/* Stores the buffer size used to relay TCP data. */
+/* The buffer size used to relay TCP data. */
 const ConnectionBuffer = 64 * 1024
 
-/* Stores the buffer size used to relay UDP payloads. */
+/* The buffer size used to relay UDP payloads. */
 const UDPBuffer = 64 * 1024
 
-/* Stores the buffer size used to parse SOCKS5 handshakes. */
+/* The buffer size used to parse SOCKS5 handshakes. */
 const Socks5Buffer = 8 * 1024
 
-/* Defines SOCKS5 protocol constants per RFC 1928. */
+/* SOCKS5 protocol constants per RFC 1928. */
 const (
 	SocksVersion    byte = 0x05
 	CmdConnect      byte = 0x01
@@ -37,7 +39,11 @@ type bufferPool struct {
 	size int
 }
 
+/* Creates a pool of fixed-size byte slices. size must be positive. */
 func newBufferPool(size int) *bufferPool {
+	if size <= 0 {
+		panic("bufferPool: size must be positive")
+	}
 	return &bufferPool{
 		pool: sync.Pool{
 			New: func() any {
@@ -54,9 +60,10 @@ func (p *bufferPool) Get() []byte {
 	return *p.pool.Get().(*[]byte)
 }
 
+/* Returns buf to the pool. Buffers of the wrong capacity are discarded.
+ * Only return buffers of the correct capacity to avoid memory bloat.
+ * Reslice to full capacity so the next Get returns the full buffer. */
 func (p *bufferPool) Put(buf []byte) {
-	/* Only return buffers of the correct capacity to avoid memory bloat.
-	 * Reslice to full capacity so the next Get returns the full buffer. */
 	if cap(buf) == p.size {
 		buf = buf[:cap(buf)]
 		p.pool.Put(&buf)
@@ -74,6 +81,7 @@ type Service struct {
 	ListenAddr *net.TCPAddr
 }
 
+/* Writes all bytes in buf to conn, looping until all bytes are written. */
 func WriteAll(conn net.Conn, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
@@ -92,8 +100,9 @@ func WriteAll(conn net.Conn, buf []byte) error {
 
 /* Sends a SOCKS5 reply with the given reply code. */
 func SendSOCKS5Reply(conn net.Conn, rep byte) {
-	reply := []byte{SocksVersion, rep, 0x00, AtypIPv4, 0, 0, 0, 0, 0, 0}
-	_ = WriteAll(conn, reply)
+	/* Use a stack-allocated array to avoid a heap allocation on the error path. */
+	reply := [10]byte{SocksVersion, rep, 0x00, AtypIPv4}
+	_ = WriteAll(conn, reply[:])
 }
 
 /* Copies data from src to dst while refreshing idle deadlines. */
@@ -104,16 +113,18 @@ func copyConn(src, dst net.Conn) error {
 	/* Set initial deadline before the first read to guard against an immediate stall. */
 	const idleTimeout = 5 * time.Minute
 	const deadlineInterval = 30 * time.Second
-	_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
-	lastDeadlineUpdate := time.Now()
+	now := time.Now()
+	_ = src.SetReadDeadline(now.Add(idleTimeout))
+	_ = dst.SetWriteDeadline(now.Add(idleTimeout))
+	lastDeadlineUpdate := now
 
 	for {
 		/* Refresh deadline less frequently to reduce syscall overhead. */
 		if time.Since(lastDeadlineUpdate) > deadlineInterval {
-			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
-			_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
-			lastDeadlineUpdate = time.Now()
+			now = time.Now()
+			_ = src.SetReadDeadline(now.Add(idleTimeout))
+			_ = dst.SetWriteDeadline(now.Add(idleTimeout))
+			lastDeadlineUpdate = now
 		}
 
 		n, err := src.Read(buf)
@@ -138,28 +149,33 @@ func copyConn(src, dst net.Conn) error {
 	}
 }
 
+/* Copies data from a TLS connection to a TCP connection. */
 func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
 	return copyConn(srcConn, dstConn)
 }
 
+/* Copies data from a TCP connection to a TLS connection. */
 func (s *Service) TransferToTLS(tcpSrc *net.TCPConn, tlsDst net.Conn) error {
 	return copyConn(tcpSrc, tlsDst)
 }
 
+/* Returns a buffer from the UDP pool sized for a maximum UDP datagram. */
 func GetUDPBuffer() []byte {
 	return udpPool.Get()
 }
 
+/* Returns a buffer obtained via GetUDPBuffer back to the pool. */
 func PutUDPBuffer(buf []byte) {
 	udpPool.Put(buf)
 }
 
+/* Reads and validates the SOCKS5 handshake from a TLS connection,
+ * returning the target address and the requested command (CmdConnect or CmdUDPAssociate). */
 func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	buf := socks5Pool.Get()
 	defer socks5Pool.Put(buf)
 
-	/* Phase 1: Read client greeting. */
-	/* Read version and nMethods first (2 bytes). */
+	/* Phase 1: Read the client greeting (version + method list). */
 	if _, err := io.ReadFull(cliConn, buf[:2]); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 greeting header: %w", err)
 	}
@@ -178,14 +194,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 methods: %w", err)
 	}
 
-	hasNoAuth := false
-	for _, method := range buf[:nMethods] {
-		if method == 0x00 {
-			hasNoAuth = true
-			break
-		}
-	}
-	if !hasNoAuth {
+	if bytes.IndexByte(buf[:nMethods], 0x00) < 0 {
 		if err := WriteAll(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to reject unsupported SOCKS5 methods: %w", err)
 		}
@@ -197,8 +206,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		return nil, 0x00, fmt.Errorf("failed to respond to SOCKS5 greeting: %w", err)
 	}
 
-	/* Phase 2: Read connection request. */
-	/* Read header up to ATYP (4 bytes). */
+	/* Phase 2: Read the connection request header (VER, CMD, RSV, ATYP). */
 	if _, err := io.ReadFull(cliConn, buf[:4]); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 request header: %w", err)
 	}
@@ -206,6 +214,11 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	if buf[0] != SocksVersion {
 		SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
 		return nil, 0x00, fmt.Errorf("unsupported SOCKS5 version in request: 0x%02x", buf[0])
+	}
+	/* RSV must be 0x00 per RFC 1928. */
+	if buf[2] != 0x00 {
+		SendSOCKS5Reply(cliConn, 0x01)
+		return nil, 0x00, fmt.Errorf("SOCKS5 request has non-zero RSV field: 0x%02x", buf[2])
 	}
 
 	cmd := buf[1]
@@ -248,9 +261,8 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		port = int(binary.BigEndian.Uint16(buf[domainLen : domainLen+2]))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
 		ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+		cancel()
 		if err != nil || len(ipAddrs) == 0 {
 			SendSOCKS5Reply(cliConn, 0x04) /* 0x04 = host unreachable */
 			if err != nil {
