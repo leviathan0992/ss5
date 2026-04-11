@@ -4,12 +4,12 @@ package ss5
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -79,6 +79,32 @@ var (
 /* Holds the shared configuration embedded by both the client and server. */
 type Service struct {
 	ListenAddr *net.TCPAddr
+}
+
+/* Stores one parsed SOCKS5 target address without forcing domain names to be
+ * resolved during protocol parsing. */
+type socksTargetAddr struct {
+	atyp byte
+	host string
+	ip   net.IP
+	port int
+}
+
+/* Returns the internal SOCKS5 address flavor. */
+func (a *socksTargetAddr) Network() string {
+	return "socks5"
+}
+
+/* Formats the target as host:port or ip:port for dialing/logging. */
+func (a *socksTargetAddr) String() string {
+	if a == nil {
+		return ""
+	}
+	host := a.host
+	if host == "" && a.ip != nil {
+		host = a.ip.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(a.port))
 }
 
 /* Writes all bytes in buf to conn, looping until all bytes are written. */
@@ -228,8 +254,7 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		return nil, 0x00, fmt.Errorf("unsupported SOCKS5 command: 0x%02x", cmd)
 	}
 
-	var dstIP []byte
-	var port int
+	target := &socksTargetAddr{}
 
 	switch buf[3] {
 	case AtypIPv4: /* IPv4: 4 bytes. */
@@ -239,8 +264,9 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		/* Copy IP and port immediately: buf is pooled and must not be referenced after return. */
 		ip4 := make(net.IP, net.IPv4len)
 		copy(ip4, buf[:4])
-		dstIP = ip4
-		port = int(binary.BigEndian.Uint16(buf[4:6]))
+		target.atyp = AtypIPv4
+		target.ip = ip4
+		target.port = int(binary.BigEndian.Uint16(buf[4:6]))
 
 	case AtypDomain: /* Domain name. */
 		if _, err := io.ReadFull(cliConn, buf[:1]); err != nil {
@@ -257,23 +283,9 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 			return nil, 0x00, fmt.Errorf("failed to read domain and port: %w", err)
 		}
 
-		domain := string(buf[:domainLen])
-		port = int(binary.BigEndian.Uint16(buf[domainLen : domainLen+2]))
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
-		cancel()
-		if err != nil || len(ipAddrs) == 0 {
-			SendSOCKS5Reply(cliConn, 0x04) /* 0x04 = host unreachable */
-			if err != nil {
-				return nil, 0x00, fmt.Errorf("failed to resolve domain %q: %w", domain, err)
-			}
-			return nil, 0x00, fmt.Errorf("failed to resolve domain %q", domain)
-		}
-
-		resolvedIP := make(net.IP, len(ipAddrs[0].IP))
-		copy(resolvedIP, ipAddrs[0].IP)
-		dstIP = resolvedIP
+		target.atyp = AtypDomain
+		target.host = string(buf[:domainLen])
+		target.port = int(binary.BigEndian.Uint16(buf[domainLen : domainLen+2]))
 
 	case AtypIPv6: /* IPv6: 16 bytes. */
 		if _, err := io.ReadFull(cliConn, buf[:16+2]); err != nil {
@@ -282,20 +294,19 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 		/* Copy IP and port immediately: buf is pooled and must not be referenced after return. */
 		ip6 := make(net.IP, net.IPv6len)
 		copy(ip6, buf[:16])
-		dstIP = ip6
-		port = int(binary.BigEndian.Uint16(buf[16:18]))
+		target.atyp = AtypIPv6
+		target.ip = ip6
+		target.port = int(binary.BigEndian.Uint16(buf[16:18]))
 
 	default:
 		SendSOCKS5Reply(cliConn, 0x08) /* 0x08 = address type not supported */
 		return nil, 0x00, fmt.Errorf("unknown address type: 0x%02x", buf[3])
 	}
 
-	var dstAddr net.Addr
-	if cmd == CmdConnect {
-		dstAddr = &net.TCPAddr{IP: dstIP, Port: port}
-	} else {
-		dstAddr = &net.UDPAddr{IP: dstIP, Port: port}
+	if target.host == "" && target.ip == nil {
+		SendSOCKS5Reply(cliConn, 0x01)
+		return nil, 0x00, errors.New("empty SOCKS5 target address")
 	}
 
-	return dstAddr, cmd, nil
+	return target, cmd, nil
 }

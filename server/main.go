@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,155 @@ type server struct {
 	serverPEM string
 	serverKEY string
 	clientPEM string
+	udpDNS    *dnsCache
+}
+
+const maxPortNumber = 65535
+const udpDNSCacheTTL = 1 * time.Minute
+const udpDNSCacheMaxEntries = 4096
+
+type dnsCacheEntry struct {
+	ip        net.IP
+	expiresAt time.Time
+}
+
+type dnsLookupCall struct {
+	done chan struct{}
+	ip   net.IP
+	err  error
+}
+
+/* dnsCache caches UDP domain resolutions so repeated ATYP=DOMAIN packets do not
+ * synchronously hit the resolver on every datagram. */
+type dnsCache struct {
+	mu       sync.RWMutex
+	entries  map[string]dnsCacheEntry
+	inflight map[string]*dnsLookupCall
+}
+
+func newDNSCache() *dnsCache {
+	return &dnsCache{
+		entries:  make(map[string]dnsCacheEntry),
+		inflight: make(map[string]*dnsLookupCall),
+	}
+}
+
+func cloneIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	return append(net.IP(nil), ip...)
+}
+
+func (c *dnsCache) get(host string, now time.Time) (net.IP, bool) {
+	if c == nil || host == "" {
+		return nil, false
+	}
+	c.mu.RLock()
+	entry, ok := c.entries[host]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if !entry.expiresAt.After(now) {
+		c.mu.Lock()
+		if current, ok := c.entries[host]; ok && !current.expiresAt.After(now) {
+			delete(c.entries, host)
+		}
+		c.mu.Unlock()
+		return nil, false
+	}
+	return cloneIP(entry.ip), true
+}
+
+func (c *dnsCache) put(host string, ip net.IP, now time.Time) {
+	if c == nil || host == "" || ip == nil {
+		return
+	}
+	entry := dnsCacheEntry{
+		ip:        cloneIP(ip),
+		expiresAt: now.Add(udpDNSCacheTTL),
+	}
+	c.mu.Lock()
+	if len(c.entries) >= udpDNSCacheMaxEntries {
+		for key, existing := range c.entries {
+			if !existing.expiresAt.After(now) {
+				delete(c.entries, key)
+			}
+		}
+		if len(c.entries) >= udpDNSCacheMaxEntries {
+			for key := range c.entries {
+				delete(c.entries, key)
+				break
+			}
+		}
+	}
+	c.entries[host] = entry
+	c.mu.Unlock()
+}
+
+/* Resolves a UDP target hostname with a small in-memory TTL cache tuned for
+ * the UDP relay hot path. */
+func (s *server) resolveUDPHost(host string) (net.IP, error) {
+	now := time.Now()
+	if ip, ok := s.udpDNS.get(host, now); ok {
+		return ip, nil
+	}
+
+	s.udpDNS.mu.Lock()
+	if entry, ok := s.udpDNS.entries[host]; ok && entry.expiresAt.After(now) {
+		ip := cloneIP(entry.ip)
+		s.udpDNS.mu.Unlock()
+		return ip, nil
+	}
+	if call, ok := s.udpDNS.inflight[host]; ok {
+		s.udpDNS.mu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, call.err
+		}
+		return cloneIP(call.ip), nil
+	}
+	call := &dnsLookupCall{done: make(chan struct{})}
+	s.udpDNS.inflight[host] = call
+	s.udpDNS.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	cancel()
+	if err != nil {
+		s.udpDNS.mu.Lock()
+		delete(s.udpDNS.inflight, host)
+		call.err = err
+		close(call.done)
+		s.udpDNS.mu.Unlock()
+		return nil, err
+	}
+
+	var resolvedIP net.IP
+	for _, ipAddr := range ipAddrs {
+		if ipAddr.IP != nil {
+			resolvedIP = cloneIP(ipAddr.IP)
+			break
+		}
+	}
+	if resolvedIP == nil {
+		err = errors.New("no ip address found")
+		s.udpDNS.mu.Lock()
+		delete(s.udpDNS.inflight, host)
+		call.err = err
+		close(call.done)
+		s.udpDNS.mu.Unlock()
+		return nil, err
+	}
+
+	s.udpDNS.put(host, resolvedIP, now)
+	s.udpDNS.mu.Lock()
+	delete(s.udpDNS.inflight, host)
+	call.ip = cloneIP(resolvedIP)
+	close(call.done)
+	s.udpDNS.mu.Unlock()
+	return resolvedIP, nil
 }
 
 /* udpAddrKey is a compact, hashable representation of a UDP address used as
@@ -38,14 +188,18 @@ type server struct {
  * are not expected in a SOCKS5 proxy relay. */
 type udpAddrKey [18]byte
 
-/* Converts a *net.UDPAddr to its compact key without any heap allocation. */
-func makeUDPAddrKey(addr *net.UDPAddr) udpAddrKey {
+/* Converts a *net.UDPAddr to its compact key without any heap allocation.
+ * Returns false if addr is nil, has no IP, or has an invalid port. */
+func makeUDPAddrKey(addr *net.UDPAddr) (udpAddrKey, bool) {
 	var k udpAddrKey
+	if addr == nil || addr.IP == nil || addr.Port < 0 || addr.Port > maxPortNumber {
+		return k, false
+	}
 	if ip16 := addr.IP.To16(); ip16 != nil {
 		copy(k[:16], ip16)
 	}
 	binary.BigEndian.PutUint16(k[16:], uint16(addr.Port))
-	return k
+	return k, true
 }
 
 /* Builds a udpAddrKey directly from a raw 4-byte IPv4 slice and port, matching
@@ -85,77 +239,77 @@ type udpAssociation struct {
 
 /* Represents a single UDP relay connection to one remote target. */
 type udpRelay struct {
-	assoc     *udpAssociation
-	key       udpAddrKey
-	target    *net.UDPAddr
-	conn      *net.UDPConn
-	closeOnce sync.Once
+	assoc          *udpAssociation
+	key            udpAddrKey
+	target         *net.UDPAddr
+	responseHeader []byte
+	conn           *net.UDPConn
+	closeOnce      sync.Once
 	/* lastWriteDeadline stores the last time SetWriteDeadline was issued as Unix
 	 * nanoseconds. Accessed atomically to throttle setsockopt syscalls without
 	 * a mutex: at most one call per writeDeadlineRefresh interval per relay. */
 	lastWriteDeadline atomic.Int64
 }
 
+/* udpPacketJob is one client UDP datagram queued for worker processing. */
+type udpPacketJob struct {
+	assoc *udpAssociation
+	buf   []byte
+	n     int
+}
+
 const udpAssociationIdleTimeout = 5 * time.Minute
 
-/* tcpDialer is reused across all CONNECT requests. net.Dialer is safe for
+/* Encodes port into dst in network byte order.
+ * Returns false if port is outside the valid TCP/UDP port range or dst is too small. */
+func putPort(dst []byte, port int) bool {
+	if len(dst) < 2 || port < 0 || port > maxPortNumber {
+		return false
+	}
+	binary.BigEndian.PutUint16(dst[:2], uint16(port))
+	return true
+}
+
+/* Reuses one dialer across all CONNECT requests. net.Dialer is safe for
  * concurrent use, so a single instance avoids one heap allocation per request. */
 var tcpDialer = &net.Dialer{Timeout: 30 * time.Second}
 
-/* Encodes a SOCKS5 UDP reply header and payload into buf for dst.
- * Returns the number of bytes written and true on success, or 0 and false if
- * the buffer is too small or dst is invalid. */
-func buildUDPResponse(dst *net.UDPAddr, payload []byte, buf []byte) (int, bool) {
+/* Builds the fixed SOCKS5 UDP response header for dst.
+ * The payload is written separately after this header on the hot path so
+ * relay responses avoid an extra payload copy. */
+func buildUDPResponseHeader(dst *net.UDPAddr) ([]byte, bool) {
 	if dst == nil || dst.IP == nil {
-		return 0, false
+		return nil, false
 	}
-	/* Ensuring the buffer can hold the fixed 3-byte reserved header. */
-	if len(buf) < 3 {
-		return 0, false
+	if dst.Port < 0 || dst.Port > maxPortNumber {
+		return nil, false
 	}
-
-	/* RSV (2 bytes) and FRAG (1 byte) must be zeroed for SOCKS5 UDP replies. */
-	buf[0], buf[1], buf[2] = 0x00, 0x00, 0x00
-
-	offset := 3
 
 	if ip4 := dst.IP.To4(); ip4 != nil {
-		/* Verifying the buffer can hold the IPv4 address, port, and payload. */
-		if len(buf) < offset+1+len(ip4)+2+len(payload) {
-			return 0, false
+		header := make([]byte, 0, 3+1+len(ip4)+2)
+		header = append(header, 0x00, 0x00, 0x00, util.AtypIPv4)
+		header = append(header, ip4...)
+		var port [2]byte
+		if !putPort(port[:], dst.Port) {
+			return nil, false
 		}
-
-		buf[offset] = util.AtypIPv4 /* IPv4 address type. */
-		offset++
-		copy(buf[offset:], ip4)
-		offset += len(ip4)
-
-	} else {
-		ip6 := dst.IP.To16()
-		if ip6 == nil {
-			return 0, false
-		}
-
-		/* Verifying the buffer can hold the IPv6 address, port, and payload. */
-		if len(buf) < offset+1+len(ip6)+2+len(payload) {
-			return 0, false
-		}
-
-		buf[offset] = util.AtypIPv6 /* IPv6 address type. */
-		offset++
-		copy(buf[offset:], ip6)
-		offset += len(ip6)
+		header = append(header, port[:]...)
+		return header, true
 	}
 
-	/* Appending the destination port in network byte order. */
-	binary.BigEndian.PutUint16(buf[offset:offset+2], uint16(dst.Port))
-	offset += 2
-
-	/* Copying the payload after the SOCKS5 UDP header. */
-	copy(buf[offset:], payload)
-	offset += len(payload)
-
-	return offset, true
+	ip6 := dst.IP.To16()
+	if ip6 == nil {
+		return nil, false
+	}
+	header := make([]byte, 0, 3+1+len(ip6)+2)
+	header = append(header, 0x00, 0x00, 0x00, util.AtypIPv6)
+	header = append(header, ip6...)
+	var port [2]byte
+	if !putPort(port[:], dst.Port) {
+		return nil, false
+	}
+	header = append(header, port[:]...)
+	return header, true
 }
 
 /* Returns a deep copy of addr, or nil if addr is nil. */
@@ -241,25 +395,31 @@ func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRela
 	if err != nil {
 		return nil, err
 	}
+	responseHeader, ok := buildUDPResponseHeader(dst)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("invalid udp relay target address")
+	}
 
 	relay := &udpRelay{
-		assoc:  a,
-		key:    key,
-		target: cloneUDPAddr(dst),
-		conn:   conn,
+		assoc:          a,
+		key:            key,
+		target:         cloneUDPAddr(dst),
+		responseHeader: responseHeader,
+		conn:           conn,
 	}
 
 	/* Slow path: take the write lock to insert the new relay. */
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		return nil, errors.New("udp association closed")
 	}
 	if existing, ok := a.relays[key]; ok {
 		/* Another goroutine raced and created a relay for this target first. */
 		a.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		return existing, nil
 	}
 	a.relays[key] = relay
@@ -320,10 +480,16 @@ func (r *udpRelay) readLoop() {
 		return
 	}
 	defer r.assoc.wg.Done()
-	respBuf := util.GetUDPBuffer()
-	defer util.PutUDPBuffer(respBuf)
 	packetBuf := util.GetUDPBuffer()
 	defer util.PutUDPBuffer(packetBuf)
+	headerLen := len(r.responseHeader)
+	if headerLen == 0 || headerLen >= len(packetBuf) {
+		log.Printf("UDP relay: invalid response header length %d for %s", headerLen, r.target)
+		r.assoc.removeRelay(r.key, r)
+		r.close()
+		return
+	}
+	copy(packetBuf[:headerLen], r.responseHeader)
 
 	/* Refresh read/write deadlines at most once per minute instead of once per
 	 * packet. Under high UDP traffic this eliminates O(PPS) setsockopt syscalls
@@ -339,7 +505,7 @@ func (r *udpRelay) readLoop() {
 	lastWriteDeadline := now
 
 	for {
-		nRead, err := r.conn.Read(respBuf)
+		nRead, _, _, _, err := r.conn.ReadMsgUDP(packetBuf[headerLen:], nil)
 		if err != nil {
 			/* Timeout and closed-connection errors are expected during shutdown; log the rest. */
 			var netErr net.Error
@@ -359,11 +525,7 @@ func (r *udpRelay) readLoop() {
 			lastReadDeadline = now
 		}
 
-		total, ok := buildUDPResponse(r.target, respBuf[:nRead], packetBuf)
-		if !ok {
-			log.Printf("UDP relay: failed to build response for %s (nRead=%d)", r.target, nRead)
-			continue
-		}
+		total := headerLen + nRead
 
 		/* Refresh the write deadline periodically so a slow client does not
 		 * stall the relay goroutine indefinitely. */
@@ -377,6 +539,16 @@ func (r *udpRelay) readLoop() {
 			r.close()
 			return
 		}
+	}
+}
+
+/* Reuses a fixed goroutine to process queued UDP packets, avoiding
+ * per-datagram goroutine creation on the hot path. */
+func (s *server) udpPacketWorker(jobs <-chan udpPacketJob, workerWg *sync.WaitGroup) {
+	defer workerWg.Done()
+	for job := range jobs {
+		s.handleUDPPacket(job.assoc, job.buf, job.n)
+		util.PutUDPBuffer(job.buf)
 	}
 }
 
@@ -413,6 +585,10 @@ func resolvePublicIP(publicAddr string) (net.IP, error) {
 /* Constructs a server from the given configuration parameters.
  * Returns nil and logs an error if any parameter is invalid. */
 func NewServer(listenAddr string, publicAddr string, serverPEM string, serverKEY string, clientPEM string) *server {
+	serverPEM = filepath.Clean(serverPEM)
+	serverKEY = filepath.Clean(serverKEY)
+	clientPEM = filepath.Clean(clientPEM)
+
 	tcpAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
 	if err != nil {
 		log.Printf("Failed to resolve listen address %s: %v", listenAddr, err)
@@ -432,6 +608,7 @@ func NewServer(listenAddr string, publicAddr string, serverPEM string, serverKEY
 		serverPEM: serverPEM,
 		serverKEY: serverKEY,
 		clientPEM: clientPEM,
+		udpDNS:    newDNSCache(),
 	}
 }
 
@@ -487,7 +664,7 @@ func (s *server) ListenTLS() error {
 		signal.Stop(sigChan)
 		log.Println("Received shutdown signal, closing...")
 		closing.Store(true)
-		listener.Close()
+		_ = listener.Close()
 	}()
 
 	const maxConnections = 4096
@@ -512,7 +689,7 @@ func (s *server) ListenTLS() error {
 			}()
 		default:
 			log.Println("Connection limit reached, dropping connection")
-			cliConn.Close()
+			_ = cliConn.Close()
 		}
 	}
 }
@@ -561,7 +738,7 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 		}
 		tcpDst, ok := dstConn.(*net.TCPConn)
 		if !ok {
-			dstConn.Close()
+			_ = dstConn.Close()
 			util.SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
 			return
 		}
@@ -600,7 +777,11 @@ func (s *server) handleTLSConn(cliConn net.Conn) {
 			resp = append(resp, ip6...)
 		}
 		var port [2]byte
-		binary.BigEndian.PutUint16(port[:], uint16(boundAddr.Port))
+		if !putPort(port[:], boundAddr.Port) {
+			log.Printf("The server got an invalid local TCP port %d for destination %s.", boundAddr.Port, targetAddr)
+			util.SendSOCKS5Reply(cliConn, 0x01)
+			return
+		}
 		resp = append(resp, port[:]...)
 
 		if err := util.WriteAll(cliConn, resp); err != nil {
@@ -692,7 +873,7 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 		return
 	}
 	var udpCloseOnce sync.Once
-	closeUDP := func() { udpCloseOnce.Do(func() { udpConn.Close() }) }
+	closeUDP := func() { udpCloseOnce.Do(func() { _ = udpConn.Close() }) }
 	defer closeUDP()
 
 	/* Preparing the public response address for the client. */
@@ -726,7 +907,11 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 	}
 
 	var port [2]byte
-	binary.BigEndian.PutUint16(port[:], uint16(publicAddr.Port))
+	if !putPort(port[:], publicAddr.Port) {
+		log.Printf("The server got an invalid public UDP port %d.", publicAddr.Port)
+		util.SendSOCKS5Reply(cliConn, 0x01)
+		return
+	}
 
 	/* Pre-allocate: VER + REP + RSV + ATYP (4) + IP + PORT (2). */
 	resp := make([]byte, 0, 4+len(ip)+2)
@@ -747,13 +932,20 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 		closeUDP()
 	}()
 
-	/* Use a semaphore to limit concurrent UDP packet handlers. */
+	/* Use a fixed worker pool and bounded queue to avoid one goroutine per
+	 * datagram while still dropping packets under sustained overload. */
 	const maxConcurrentUDP = 64
-	sem := make(chan struct{}, maxConcurrentUDP)
-	var wg sync.WaitGroup
+	jobs := make(chan udpPacketJob, maxConcurrentUDP)
+	var workerWg sync.WaitGroup
+	for i := 0; i < maxConcurrentUDP; i++ {
+		workerWg.Add(1)
+		go s.udpPacketWorker(jobs, &workerWg)
+	}
 	var allowedSrc *net.UDPAddr
 	var assoc *udpAssociation
 	defer func() {
+		close(jobs)
+		workerWg.Wait()
 		if assoc != nil {
 			assoc.Close()
 		}
@@ -776,8 +968,6 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 		n, srcAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			util.PutUDPBuffer(buf)
-			/* Wait for all ongoing handlers to finish before returning. */
-			wg.Wait()
 			return
 		}
 
@@ -823,22 +1013,13 @@ func (s *server) handleUDPAssociate(cliConn net.Conn) {
 			continue
 		}
 
-		/* Handle UDP packet concurrently; drop packet if all slots are busy. */
+		/* Queue UDP packet for worker processing; drop packet if the queue is full. */
 		select {
-		case sem <- struct{}{}:
+		case jobs <- udpPacketJob{assoc: assoc, buf: buf, n: n}:
 		default:
 			util.PutUDPBuffer(buf)
 			continue
 		}
-		wg.Add(1)
-		go func(buf []byte, n int) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-			defer util.PutUDPBuffer(buf)
-			s.handleUDPPacket(assoc, buf, n)
-		}(buf, n)
 	}
 }
 
@@ -874,7 +1055,7 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 		headerLen = 10
 
 	case util.AtypDomain:
-		/* Domain targets require a DNS lookup and always go through the slow path. */
+		/* Domain targets use a small TTL cache to avoid resolving on every packet. */
 		if n < 5 {
 			return
 		}
@@ -885,17 +1066,18 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 		host := string(buf[5 : 5+hostLen])
 		port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		cancel()
-		if err != nil || len(ipAddrs) == 0 {
+		ip, err := s.resolveUDPHost(host)
+		if err != nil {
 			log.Printf("UDP relay DNS lookup failed for %q: %v", host, err)
 			return
 		}
-		ip := make(net.IP, len(ipAddrs[0].IP))
-		copy(ip, ipAddrs[0].IP)
 		dstAddr := &net.UDPAddr{IP: ip, Port: port}
-		key = makeUDPAddrKey(dstAddr)
+		var ok bool
+		key, ok = makeUDPAddrKey(dstAddr)
+		if !ok {
+			log.Printf("UDP relay DNS lookup produced invalid target %v", dstAddr)
+			return
+		}
 		headerLen = 5 + hostLen + 2
 		payload := buf[headerLen:n]
 		if len(payload) == 0 {
@@ -942,7 +1124,7 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 	s.writeUDPPayload(assoc, relay, payload)
 }
 
-/* forwardUDPPayload obtains or creates the relay for (key, dst) and sends payload. */
+/* Obtains or creates the relay for (key, dst) and sends payload. */
 func (s *server) forwardUDPPayload(assoc *udpAssociation, key udpAddrKey, dst *net.UDPAddr, payload []byte) {
 	relay, err := assoc.relayForKey(key, dst)
 	if err != nil {
@@ -952,8 +1134,8 @@ func (s *server) forwardUDPPayload(assoc *udpAssociation, key udpAddrKey, dst *n
 	s.writeUDPPayload(assoc, relay, payload)
 }
 
-/* writeUDPPayload sends payload through relay, throttling SetWriteDeadline to
- * at most once per writeDeadlineRefresh to avoid a syscall on every datagram. */
+/* Sends payload through relay, throttling SetWriteDeadline to at most once per
+ * writeDeadlineRefresh to avoid a syscall on every datagram. */
 func (s *server) writeUDPPayload(assoc *udpAssociation, relay *udpRelay, payload []byte) {
 	const writeDeadlineRefresh = int64(10 * time.Second)
 	const writeDeadlineDuration = 30 * time.Second
@@ -989,6 +1171,7 @@ func main() {
 	flag.StringVar(&confPath, "c", ".ss5-server.json", "The server configuration file.")
 	flag.Parse()
 
+	confPath = filepath.Clean(confPath)
 	bytes, err := os.ReadFile(confPath)
 	if err != nil {
 		log.Fatalf("The server failed to read the configuration file: %v", err)

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -37,14 +38,14 @@ type client struct {
 	stableIndex atomic.Uint32
 }
 
-/* serverDialer is reused across all upstream dial attempts. net.Dialer is safe
- * for concurrent use, so a single instance avoids one heap allocation per dial. */
+/* Reuses one dialer across all upstream dial attempts. net.Dialer is safe for
+ * concurrent use, so a single instance avoids one heap allocation per dial. */
 var serverDialer = &net.Dialer{
 	Timeout:   30 * time.Second,
 	KeepAlive: 30 * time.Second,
 }
 
-/* dialUpstream opens a TLS connection to a single upstream endpoint.
+/* Opens a TLS connection to a single upstream endpoint.
  * Defined at package level so dialServer creates no closure on each call. */
 func dialUpstream(upstream upstreamEndpoint) (net.Conn, error) {
 	return tls.DialWithDialer(serverDialer, "tcp", upstream.addrStr, upstream.tlsConfig)
@@ -53,6 +54,10 @@ func dialUpstream(upstream upstreamEndpoint) (net.Conn, error) {
 /* Constructs a client from the given configuration parameters.
  * Returns nil and logs an error if any parameter is invalid. */
 func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY string, serverPEM string) *client {
+	clientPEM = filepath.Clean(clientPEM)
+	clientKEY = filepath.Clean(clientKEY)
+	serverPEM = filepath.Clean(serverPEM)
+
 	listenAddr, err := net.ResolveTCPAddr("tcp", listen)
 	if err != nil {
 		log.Printf("Failed to resolve listen address %s: %v", listen, err)
@@ -186,7 +191,7 @@ func (c *client) Listen() error {
 		signal.Stop(sigChan)
 		log.Println("Received shutdown signal, closing...")
 		closing.Store(true)
-		listener.Close()
+		_ = listener.Close()
 	}()
 
 	const maxConnections = 1024
@@ -219,7 +224,7 @@ func (c *client) Listen() error {
 			}()
 		default:
 			log.Println("Connection limit reached, dropping connection")
-			userConn.Close()
+			_ = userConn.Close()
 		}
 	}
 }
@@ -235,7 +240,7 @@ func (c *client) connectServer(userConn *net.TCPConn) {
 
 	/* SOCKS5 connections are stateful; once used a connection cannot be reused. */
 	var srvCloseOnce sync.Once
-	closeSrv := func() { srvCloseOnce.Do(func() { srvConn.Close() }) }
+	closeSrv := func() { srvCloseOnce.Do(func() { _ = srvConn.Close() }) }
 	defer closeSrv()
 
 	var wg sync.WaitGroup
@@ -293,6 +298,7 @@ func main() {
 	flag.StringVar(&confPath, "c", ".ss5-client.json", "The client configuration file.")
 	flag.Parse()
 
+	confPath = filepath.Clean(confPath)
 	bytes, err := os.ReadFile(confPath)
 	if err != nil {
 		log.Fatalf("The client failed to read the configuration file: %v", err)

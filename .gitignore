@@ -27,3 +27,4 @@ tags
 build/
 client/client
 server/server
+.omx
