@@ -61,6 +61,13 @@ stateful UDP protocols can retain a stable upstream tuple.
    client accepts local SOCKS5 without authentication and authenticates to
    each upstream using its configured credentials.
 
+   With multiple upstreams, the client automatically selects by smoothed
+   connection setup time: `score = 0.75 * previous + 0.25 * sample` (milliseconds;
+   failures count as 5000). Probes use the configured credentials every 30 seconds.
+   A node must score at least 20% lower for two rounds before switching; connection
+   failures trigger failover immediately. Existing tunnels stay on their original
+   upstream. This measures connection reliability and latency, not bandwidth.
+
 3. Start the ss5-client:
    ```shell
    ./ss5-client -c .ss5-client.json

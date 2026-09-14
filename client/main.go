@@ -21,7 +21,7 @@ import (
 )
 
 /* Holds the address and pre-built TLS config for one upstream server.
- * The TLS config is pre-cloned with the correct ServerName so dialServer avoids
+ * The TLS config is pre-cloned with the correct ServerName so dialing avoids
  * cloning it on every connection attempt. addrStr is the pre-computed string form
  * of addr so dialing never allocates it on the hot path. */
 type upstreamEndpoint struct {
@@ -41,6 +41,7 @@ type client struct {
 	stableIndex atomic.Uint32
 	negotiate   bool
 	pool        *preconnectPool
+	selector    *upstreamSelector
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -172,7 +173,7 @@ func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY str
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &client{
+	c := &client{
 		Service: &util.Service{
 			ListenAddr: listenAddr,
 		},
@@ -181,25 +182,21 @@ func NewClient(listen string, srvAddrs []string, clientPEM string, clientKEY str
 		upstreams: upstreams,
 		negotiate: len(authMap) > 0,
 	}
+	c.selector = newUpstreamSelector(c)
+	return c
 }
 
-/* Establishes a TLS connection to an upstream server, preferring the
- * last-stable endpoint and falling back to the others on failure. */
+/* Tries the selected upstream first, then alternatives ordered by health and
+ * score. Unknown and unavailable nodes remain eligible as a last resort. */
 func (c *client) acquireServer(allowPool bool) (net.Conn, bool, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
-	stableIdx := int(c.stableIndex.Load())
+	order, generation := c.selector.plan()
+	stableIdx := order[0]
 	if allowPool && c.pool != nil {
 		if conn := c.pool.take(stableIdx); conn != nil {
 			log.Printf("Using preconnected server %s", c.upstreams[stableIdx].label)
 			return conn, true, nil
-		}
-	}
-	order := make([]int, 0, len(c.upstreams))
-	order = append(order, stableIdx)
-	for i := range c.upstreams {
-		if i != stableIdx {
-			order = append(order, i)
 		}
 	}
 	var err error
@@ -208,15 +205,15 @@ func (c *client) acquireServer(allowPool bool) (net.Conn, bool, error) {
 			return nil, false, ctx.Err()
 		}
 		var conn net.Conn
+		start := time.Now()
 		conn, err = dialUpstream(ctx, c.upstreams[index])
 		if err == nil {
-			if c.pool != nil {
-				c.pool.selectUpstream(index)
-			} else {
-				c.stableIndex.Store(uint32(index))
-			}
+			c.selector.connected(index, generation)
 			log.Printf("Connected to server %s", c.upstreams[index].label)
 			return conn, false, nil
+		}
+		if ctx.Err() == nil {
+			c.selector.failed(index, start)
 		}
 		log.Printf("Failed to connect to server %s: %v", c.upstreams[index].label, err)
 	}
@@ -261,6 +258,16 @@ func (c *client) Listen() error {
 		go c.pool.run()
 		defer c.pool.close()
 		log.Printf("Preconnection pool enabled: size=%d, TTL=10s, refill stops after 10s idle", c.pool.size)
+	}
+
+	if len(c.upstreams) > 1 {
+		probeCtx, stopProbes := context.WithCancel(c.ctx)
+		probeDone := make(chan struct{})
+		go func() {
+			defer close(probeDone)
+			c.selector.run(probeCtx)
+		}()
+		defer func() { stopProbes(); <-probeDone }()
 	}
 
 	/* Setup graceful shutdown using atomic flag to avoid race condition. */

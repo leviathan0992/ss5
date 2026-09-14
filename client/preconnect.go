@@ -95,7 +95,7 @@ func (p *preconnectPool) take(index int) net.Conn {
 	return nil
 }
 
-// Foreground failover is the only operation that changes the selected upstream.
+// Selection changes drain only unused connections; active tunnels stay open.
 // Generation checks discard a background dial finishing after a switch.
 func (p *preconnectPool) selectUpstream(index int) {
 	p.mu.Lock()
