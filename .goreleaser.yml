@@ -1,6 +1,6 @@
 version: 2
 builds:
-  - main: ./client/main.go
+  - main: ./client
     id: "ss5-client"
     binary: ss5-client
     goos:
@@ -8,7 +8,7 @@ builds:
       - darwin
       - windows
 
-  - main: ./server/main.go
+  - main: ./server
     id: "ss5-server"
     binary: ss5-server
     goos:
@@ -68,6 +68,7 @@ archives:
       - ss5-client.service
       - ss5-server.service
       - README.md
+      - LICENSE
 
 release:
   # Repo in which the release will be created.

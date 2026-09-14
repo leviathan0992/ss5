@@ -1159,6 +1159,8 @@ func (s *server) writeUDPPayload(assoc *udpAssociation, relay *udpRelay, payload
 }
 
 type Config struct {
+	Username   string `json:"username,omitempty"`
+	Password   string `json:"password,omitempty"`
 	ServerPEM  string `json:"server_pem"`
 	ServerKey  string `json:"server_key"`
 	ClientPEM  string `json:"client_pem"`
@@ -1195,11 +1197,20 @@ func main() {
 		log.Fatalf("Configuration field client_pem is required")
 	}
 
+	var auth *util.Credentials
+	if config.Username != "" || config.Password != "" {
+		auth = &util.Credentials{Username: config.Username, Password: config.Password}
+		if err := auth.Validate(); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	s := NewServer(config.ListenAddr, config.PublicAddr, config.ServerPEM, config.ServerKey, config.ClientPEM)
 	if s == nil {
 		log.Fatalf("Failed to create server")
 	}
 
+	s.Auth = auth
 	if err := s.ListenTLS(); err != nil {
 		log.Fatalf("Server exited with error: %v", err)
 	}

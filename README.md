@@ -26,11 +26,11 @@ stateful UDP protocols can retain a stable upstream tuple.
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.1/ss5_0.1.1_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.3/ss5_0.1.3_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.1_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.3_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.1_Linux_x86_64
+   cd ss5_0.1.3_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:
@@ -40,15 +40,26 @@ stateful UDP protocols can retain a stable upstream tuple.
    
    {
     "server_addr": [
-      "127.0.0.1:58",
+      "127.0.0.1:443",
       "127.0.0.1:53"
     ],
     "listen_addr": "127.0.0.1:2024",
     "client_pem": "/etc/client.pem",
     "client_key": "/etc/client.key",
-    "server_pem": "/etc/server.pem"
+    "server_pem": "/etc/server.pem",
+    "server_auth": {
+      "127.0.0.1:443": {
+        "username": "your-user",
+        "password": "your-password"
+      }
+    }
     }
    ```
+
+   Optional `server_auth` maps upstream addresses to SOCKS5 credentials.
+   Each address must match an entry in `server_addr`. When configured, the
+   client accepts local SOCKS5 without authentication and authenticates to
+   each upstream using its configured credentials.
 
 3. Start the ss5-client:
    ```shell
@@ -65,9 +76,14 @@ stateful UDP protocols can retain a stable upstream tuple.
     "public_addr": "",
     "server_key": "/etc/server.key",
     "server_pem": "/etc/server.pem",
-    "client_pem": "/etc/client.pem"
+    "client_pem": "/etc/client.pem",
+    "username": "your-user",
+    "password": "your-password"
     }
    ```
+
+   Set both `username` and `password` to require matching client credentials
+   in addition to mTLS. Omit both for certificate-only authentication.
 
    `public_addr` is optional, but it is recommended when the server runs
    behind NAT, an Elastic IP, a cloud private network, or any other topology

@@ -3,7 +3,6 @@
 package ss5
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -79,6 +78,7 @@ var (
 /* Holds the shared configuration embedded by both the client and server. */
 type Service struct {
 	ListenAddr *net.TCPAddr
+	Auth       *Credentials
 }
 
 /* Stores one parsed SOCKS5 target address without forcing domain names to be
@@ -108,7 +108,7 @@ func (a *socksTargetAddr) String() string {
 }
 
 /* Writes all bytes in buf to conn, looping until all bytes are written. */
-func WriteAll(conn net.Conn, buf []byte) error {
+func WriteAll(conn io.Writer, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
 		if n > 0 {
@@ -201,35 +201,8 @@ func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
 	buf := socks5Pool.Get()
 	defer socks5Pool.Put(buf)
 
-	/* Phase 1: Read the client greeting (version + method list). */
-	if _, err := io.ReadFull(cliConn, buf[:2]); err != nil {
-		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 greeting header: %w", err)
-	}
-
-	/* Verify SOCKS5 version (0x05). */
-	if buf[0] != SocksVersion {
-		return nil, 0x00, fmt.Errorf("unsupported SOCKS version in greeting: 0x%02x", buf[0])
-	}
-
-	nMethods := int(buf[1])
-	if nMethods == 0 {
-		return nil, 0x00, errors.New("SOCKS5 greeting has zero methods")
-	}
-	/* Read the methods list. */
-	if _, err := io.ReadFull(cliConn, buf[:nMethods]); err != nil {
-		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 methods: %w", err)
-	}
-
-	if bytes.IndexByte(buf[:nMethods], 0x00) < 0 {
-		if err := WriteAll(cliConn, []byte{SocksVersion, 0xFF}); err != nil {
-			return nil, 0x00, fmt.Errorf("failed to reject unsupported SOCKS5 methods: %w", err)
-		}
-		return nil, 0x00, errors.New("client does not offer SOCKS5 no-authentication method")
-	}
-
-	/* Reply: SOCKS5, no authentication required. */
-	if err := WriteAll(cliConn, []byte{SocksVersion, 0x00}); err != nil {
-		return nil, 0x00, fmt.Errorf("failed to respond to SOCKS5 greeting: %w", err)
+	if err := NegotiateServer(cliConn, s.Auth); err != nil {
+		return nil, 0, err
 	}
 
 	/* Phase 2: Read the connection request header (VER, CMD, RSV, ATYP). */
