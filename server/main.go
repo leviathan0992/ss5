@@ -1,3 +1,4 @@
+// Ss5-server serves SOCKS5 TCP and UDP traffic over mutually authenticated TLS.
 package main
 
 import (
@@ -21,65 +22,65 @@ import (
 	"syscall"
 	"time"
 
-	util "github.com/leviathan0992/ss5"
+	"github.com/leviathan0992/ss5"
 )
 
-// Holds the configuration and state for the SOCKS5-over-TLS server.
+// server holds the TLS listener settings and shared UDP resolver cache.
 type server struct {
-	*util.Service
+	*ss5.Service
 	publicIP  net.IP
 	serverPEM string
-	serverKEY string
+	serverKey string
 	clientPEM string
 	udpDNS    *dnsCache
 }
 
+// Config holds the server settings read from the JSON configuration file.
 type Config struct {
+	// Username and Password enable SOCKS5 authentication when either is set.
+	// Both must then contain 1 to 255 bytes.
 	Username   string `json:"username,omitempty"`
 	Password   string `json:"password,omitempty"`
-	ServerPEM  string `json:"server_pem"`
-	ServerKey  string `json:"server_key"`
-	ClientPEM  string `json:"client_pem"`
-	ListenAddr string `json:"listen_addr"`
-	PublicAddr string `json:"public_addr"`
+	ServerPEM  string `json:"server_pem"`  // Server certificate file.
+	ServerKey  string `json:"server_key"`  // Server private key file.
+	ClientPEM  string `json:"client_pem"`  // Trusted client CA file.
+	ListenAddr string `json:"listen_addr"` // TLS listen address.
+	PublicAddr string `json:"public_addr"` // Optional address advertised for UDP relays.
 }
 
-// Reuses one dialer across all CONNECT requests. net.Dialer is safe for
-// concurrent use, so a single instance avoids one heap allocation per request.
+// tcpDialer is shared by concurrent SOCKS5 CONNECT requests.
 var tcpDialer = &net.Dialer{Timeout: 30 * time.Second}
 
-// Constructs a server from the given configuration parameters.
-// Returns nil and logs an error if any parameter is invalid.
-func NewServer(listenAddr string, publicAddr string, serverPEM string, serverKEY string, clientPEM string) *server {
+// NewServer configures listener addresses and TLS credential paths.
+func NewServer(listenAddr, publicAddr, serverPEM, serverKey, clientPEM string) (*server, error) {
 	serverPEM = filepath.Clean(serverPEM)
-	serverKEY = filepath.Clean(serverKEY)
+	serverKey = filepath.Clean(serverKey)
 	clientPEM = filepath.Clean(clientPEM)
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
 	if err != nil {
-		log.Printf("Failed to resolve listen address %s: %v", listenAddr, err)
-		return nil
+		return nil, fmt.Errorf("resolve listen address %q: %w", listenAddr, err)
 	}
+
 	publicIP, err := resolvePublicIP(publicAddr)
 	if err != nil {
-		log.Printf("Failed to resolve public address %s: %v", publicAddr, err)
-		return nil
+		return nil, fmt.Errorf("resolve public address %q: %w", publicAddr, err)
 	}
 
 	return &server{
-		Service: &util.Service{
+		Service: &ss5.Service{
 			ListenAddr: tcpAddr,
 		},
 		publicIP:  publicIP,
 		serverPEM: serverPEM,
-		serverKEY: serverKEY,
+		serverKey: serverKey,
 		clientPEM: clientPEM,
 		udpDNS:    newDNSCache(),
-	}
+	}, nil
 }
 
-// Parses or resolves publicAddr to an IP address.
-// Returns nil, nil if publicAddr is empty.
+// resolvePublicIP parses or resolves publicAddr to an IP address.
+// An empty address returns nil, nil.
 func resolvePublicIP(publicAddr string) (net.IP, error) {
 	value := strings.TrimSpace(publicAddr)
 	if value == "" {
@@ -91,9 +92,11 @@ func resolvePublicIP(publicAddr string) (net.IP, error) {
 	if value == "" {
 		return nil, nil
 	}
+
 	if ip := net.ParseIP(value); ip != nil {
 		return append(net.IP(nil), ip...), nil
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, value)
@@ -105,34 +108,28 @@ func resolvePublicIP(publicAddr string) (net.IP, error) {
 			return append(net.IP(nil), ipAddr.IP...), nil
 		}
 	}
-	return nil, errors.New("no ip address found")
+	return nil, errors.New("no IP address found")
 }
 
-// Loads TLS credentials, starts accepting connections, and dispatches
-// each to handleTLSConn. Returns when a shutdown signal is received.
+// ListenTLS loads TLS credentials and serves connections until a shutdown signal
+// is received. Clients must present a certificate trusted by the configured CA.
 func (s *server) ListenTLS() error {
 	log.Printf("The server's listening address is %s.", s.ListenAddr.String())
 	if s.publicIP != nil {
 		log.Printf("The server's public UDP address is %s.", s.publicIP.String())
 	}
 
-	// Load TLS certificate and private key.
-	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKEY)
+	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKey)
 	if err != nil {
-		log.Printf("The server failed to load the TLS key pair: %v", err)
-		return err
+		return fmt.Errorf("load server certificate and key: %w", err)
 	}
 
 	certBytes, err := os.ReadFile(s.clientPEM)
 	if err != nil {
-		log.Printf("The server failed to read the client's PEM file: %v", err)
-		return err
+		return fmt.Errorf("read client CA %q: %w", s.clientPEM, err)
 	}
-
 	clientCertPool := x509.NewCertPool()
-	// Attempt to parse the PEM encoded certificates.
-	ok := clientCertPool.AppendCertsFromPEM(certBytes)
-	if !ok {
+	if !clientCertPool.AppendCertsFromPEM(certBytes) {
 		return errors.New("failed to parse PEM-encoded client certificates")
 	}
 
@@ -145,121 +142,114 @@ func (s *server) ListenTLS() error {
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
 	if err != nil {
-		log.Printf("Failed to start the server listening on %s: %v", s.ListenAddr.String(), err)
-		return err
+		return fmt.Errorf("listen on %s: %w", s.ListenAddr, err)
 	}
 	log.Printf("The server successfully started listening on %s.", s.ListenAddr.String())
 
 	stop, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
-	return util.Serve(stop, listener, 4096, s.handleTLSConn)
+	return ss5.Serve(stop, listener, 4096, s.handleTLSConn)
 }
 
-// Handles a single TLS client connection: parses the SOCKS5
-// handshake and dispatches to CONNECT or UDP ASSOCIATE handling.
-func (s *server) handleTLSConn(ctx context.Context, cliConn net.Conn) {
-	defer cliConn.Close()
-
-	_ = cliConn.SetDeadline(time.Now().Add(30 * time.Second))
-	addr, cmd, err := s.ParseSOCKS5FromTLS(cliConn)
+// handleTLSConn authenticates a client and dispatches its SOCKS5 request.
+func (s *server) handleTLSConn(ctx context.Context, clientConn net.Conn) {
+	_ = clientConn.SetDeadline(time.Now().Add(30 * time.Second))
+	addr, cmd, err := s.ParseSOCKS5FromTLS(clientConn)
 	if err != nil {
 		log.Printf("The server failed to parse the SOCKS5 protocol: %v", err)
 		return
 	}
-	_ = cliConn.SetDeadline(time.Time{})
+	_ = clientConn.SetDeadline(time.Time{})
 
 	switch cmd {
-	case util.CmdConnect:
-		s.handleTCPConnect(ctx, cliConn, addr)
-
-	case util.CmdUDPAssociate:
-		s.handleUDPAssociate(ctx, cliConn)
-
+	case ss5.CmdConnect:
+		s.handleTCPConnect(ctx, clientConn, addr)
+	case ss5.CmdUDPAssociate:
+		s.handleUDPAssociate(ctx, clientConn)
 	default:
 		log.Printf("Unexpected SOCKS5 command after parse: 0x%02x", cmd)
-		util.SendSOCKS5Reply(cliConn, 0x07)
+		ss5.SendSOCKS5Reply(clientConn, 0x07)
 	}
 }
 
 // handleTCPConnect owns the target socket and relays it after a successful reply.
-func (s *server) handleTCPConnect(ctx context.Context, cliConn net.Conn, addr net.Addr) {
+func (s *server) handleTCPConnect(ctx context.Context, clientConn net.Conn, addr net.Addr) {
 	targetAddr := addr.String()
-
-	// Attempt to connect to the destination address with a 30 s timeout.
 	dstConn, err := tcpDialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		log.Printf("The server failed to connect to the destination address %s: %v", targetAddr, err)
-		util.SendSOCKS5Reply(cliConn, dialErrToSOCKS5Code(err))
+		ss5.SendSOCKS5Reply(clientConn, dialErrToSOCKS5Code(err))
 		return
 	}
 	tcpDst, ok := dstConn.(*net.TCPConn)
 	if !ok {
 		_ = dstConn.Close()
-		util.SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
+		ss5.SendSOCKS5Reply(clientConn, 0x01) // 0x01 = general SOCKS server failure
 		return
 	}
 	defer tcpDst.Close()
-	log.Printf("The server connected to the destination address %s successfully.", targetAddr)
-
-	util.ConfigureTCPConn(tcpDst)
+	ss5.ConfigureTCPConn(tcpDst)
 
 	// Build and send the SOCKS5 success reply with the outgoing bound address.
 	boundAddr, ok := tcpDst.LocalAddr().(*net.TCPAddr)
 	if !ok {
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
+
 	var resp []byte
 	if ip4 := boundAddr.IP.To4(); ip4 != nil {
 		// IPv4 response: VER + REP + RSV + ATYP (4) + IP (4) + PORT (2) = 10 bytes.
 		resp = make([]byte, 0, 10)
-		resp = append(resp, util.SocksVersion, 0x00, 0x00, util.AtypIPv4)
+		resp = append(resp, ss5.SocksVersion, 0x00, 0x00, ss5.AtypIPv4)
 		resp = append(resp, ip4...)
 	} else {
 		ip6 := boundAddr.IP.To16()
 		if ip6 == nil {
-			util.SendSOCKS5Reply(cliConn, 0x01)
+			ss5.SendSOCKS5Reply(clientConn, 0x01)
 			return
 		}
 		// IPv6 response: VER + REP + RSV + ATYP (4) + IP (16) + PORT (2) = 22 bytes.
 		resp = make([]byte, 0, 22)
-		resp = append(resp, util.SocksVersion, 0x00, 0x00, util.AtypIPv6)
+		resp = append(resp, ss5.SocksVersion, 0x00, 0x00, ss5.AtypIPv6)
 		resp = append(resp, ip6...)
 	}
+
 	var port [2]byte
 	if !putPort(port[:], boundAddr.Port) {
 		log.Printf("The server got an invalid local TCP port %d for destination %s.", boundAddr.Port, targetAddr)
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
 	resp = append(resp, port[:]...)
 
-	if err := util.WriteAll(cliConn, resp); err != nil {
+	if err := ss5.WriteAll(clientConn, resp); err != nil {
 		log.Printf("The server connected to the destination, but failed to respond to the client: %v", err)
 		return
 	}
 
-	if err := util.Relay(cliConn, tcpDst); err != nil {
+	if err := ss5.Relay(clientConn, tcpDst); err != nil {
 		log.Printf("Connection relay ended: %v", err)
 	}
 }
 
-// Maps a dial error to the appropriate SOCKS5 reply code per RFC 1928.
+// dialErrToSOCKS5Code maps a dial error to an RFC 1928 reply code.
 func dialErrToSOCKS5Code(err error) byte {
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
-		return 0x05 /* connection refused */
+		return 0x05 // connection refused
 	}
 	if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL) {
-		return 0x03 /* network unreachable */
+		return 0x03 // network unreachable
 	}
 	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EHOSTDOWN) || errors.Is(err, syscall.ETIMEDOUT) {
-		return 0x04 /* host unreachable */
+		return 0x04 // host unreachable
 	}
+
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return 0x04 /* host unreachable (timeout) */
+		return 0x04 // host unreachable (timeout)
 	}
-	return 0x01 /* general SOCKS server failure */
+	return 0x01 // general SOCKS server failure
 }
 
 const (
@@ -272,10 +262,10 @@ const (
 var (
 	udpAssociationSlots = make(chan struct{}, maxUDPAssociations)
 	udpRelaySlots       = make(chan struct{}, maxUDPRelays)
-	errUDPRelayLimit    = errors.New("udp relay capacity reached")
+	errUDPRelayLimit    = errors.New("UDP relay capacity reached")
 )
 
-// Tracks the UDP relay state for a single SOCKS5 UDP ASSOCIATE session.
+// udpAssociation owns the relays for one SOCKS5 UDP ASSOCIATE session.
 type udpAssociation struct {
 	clientConn *net.UDPConn
 	clientAddr *net.UDPAddr
@@ -292,7 +282,7 @@ type udpAssociation struct {
 	wg      sync.WaitGroup
 }
 
-// Represents a single UDP relay connection to one remote target.
+// udpRelay forwards datagrams between an association and one remote target.
 type udpRelay struct {
 	assoc          *udpAssociation
 	key            udpAddrKey
@@ -301,6 +291,7 @@ type udpRelay struct {
 	conn           *net.UDPConn
 	closeOnce      sync.Once
 	activity       idleClock
+
 	// Last write-deadline refresh in Unix nanoseconds. Atomic access allows
 	// forwarding workers to share a relay without a data race.
 	lastWriteDeadline atomic.Int64
@@ -311,32 +302,31 @@ type udpPacketJob struct {
 	assoc *udpAssociation
 	buf   *[]byte // Ownership passes to the worker only after successful enqueue.
 	n     int
-	ip    net.IP // Cached domain result; nil for IP targets and DNS misses.
+	ip    netip.Addr // Cached domain result; invalid for IP targets and DNS misses.
 }
 
-// Handles a SOCKS5 UDP ASSOCIATE command: binds a UDP socket,
-// advertises the relay address to the client, and forwards datagrams until the
-// TCP control connection closes or the idle timeout fires.
-func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
+// handleUDPAssociate binds and advertises a UDP relay, then forwards datagrams
+// until the TCP control connection closes or the association expires.
+func (s *server) handleUDPAssociate(ctx context.Context, clientConn net.Conn) {
 	select {
 	case udpAssociationSlots <- struct{}{}:
 		defer func() { <-udpAssociationSlots }()
 	default:
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
 
 	// Validate the TCP control connection's remote address before committing
 	// to any response so we can send a proper error reply if the check fails.
-	tcpRemote, ok := cliConn.RemoteAddr().(*net.TCPAddr)
+	tcpRemote, ok := clientConn.RemoteAddr().(*net.TCPAddr)
 	if !ok || tcpRemote.IP == nil {
 		log.Println("The server failed to determine the UDP association client address.")
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
 	controlIP, ok := netip.AddrFromSlice(tcpRemote.IP)
 	if !ok {
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
 	controlIP = controlIP.Unmap()
@@ -347,7 +337,7 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 	publicIP := s.publicIP
 	if publicIP == nil {
 		publicIP = s.ListenAddr.IP
-		if localTCP, ok := cliConn.LocalAddr().(*net.TCPAddr); ok &&
+		if localTCP, ok := clientConn.LocalAddr().(*net.TCPAddr); ok &&
 			localTCP.IP != nil &&
 			!localTCP.IP.IsUnspecified() {
 			publicIP = localTCP.IP
@@ -355,7 +345,7 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 	}
 	if publicIP == nil || publicIP.IsUnspecified() {
 		log.Println("The server failed to determine the public UDP address.")
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
 
@@ -365,11 +355,16 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 	udpConn, err := net.ListenUDP("udp", udpWildcardAddrFor(publicIP))
 	if err != nil {
 		log.Printf("The server failed to listen on UDP: %v", err)
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
+
 	var udpCloseOnce sync.Once
-	closeUDP := func() { udpCloseOnce.Do(func() { _ = udpConn.Close() }) }
+	closeUDP := func() {
+		udpCloseOnce.Do(func() {
+			_ = udpConn.Close()
+		})
+	}
 	defer closeUDP()
 	stopClosing := context.AfterFunc(ctx, closeUDP)
 	defer stopClosing()
@@ -377,11 +372,10 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 	resp, err := udpAssociateReply(udpConn, publicIP)
 	if err != nil {
 		log.Print(err)
-		util.SendSOCKS5Reply(cliConn, 0x01)
+		ss5.SendSOCKS5Reply(clientConn, 0x01)
 		return
 	}
-
-	if err := util.WriteAll(cliConn, resp); err != nil {
+	if err := ss5.WriteAll(clientConn, resp); err != nil {
 		log.Printf("The server failed to respond to the client after the UDP associate: %v", err)
 		return
 	}
@@ -390,7 +384,7 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 	// connection closes. Monitor it and close UDP when it drops.
 	go func() {
 		var buf [1]byte
-		_, _ = cliConn.Read(buf[:])
+		_, _ = clientConn.Read(buf[:])
 		closeUDP()
 	}()
 
@@ -401,33 +395,34 @@ func (s *server) handleUDPAssociate(ctx context.Context, cliConn net.Conn) {
 func udpAssociateReply(udpConn *net.UDPConn, publicIP net.IP) ([]byte, error) {
 	udpAddr, ok := udpConn.LocalAddr().(*net.UDPAddr)
 	if !ok {
-		return nil, errors.New("The server failed to get the UDP local address.")
+		return nil, errors.New("failed to get UDP local address")
 	}
 	publicAddr := udpPublicAddrFor(publicIP, udpAddr.Port)
 	if publicAddr.IP == nil {
-		return nil, errors.New("The server failed to determine a valid public IP for UDP response.")
+		return nil, errors.New("no valid public IP for UDP response")
 	}
 	if publicAddr.Port == 0 {
-		return nil, errors.New("The server bound UDP on port 0; cannot advertise a valid relay address.")
+		return nil, errors.New("cannot advertise UDP relay on port 0")
 	}
+
 	ip := publicAddr.IP.To4()
-	addressType := util.AtypIPv4 /* IPv4. */
+	addressType := ss5.AtypIPv4
 	if ip == nil {
 		ip = publicAddr.IP.To16()
-		addressType = util.AtypIPv6 /* IPv6. */
+		addressType = ss5.AtypIPv6
 	}
 	if ip == nil {
-		return nil, errors.New("The server failed to normalize public IP for UDP response.")
+		return nil, errors.New("failed to normalize public IP for UDP response")
 	}
 
 	var port [2]byte
 	if !putPort(port[:], publicAddr.Port) {
-		return nil, fmt.Errorf("The server got an invalid public UDP port %d.", publicAddr.Port)
+		return nil, fmt.Errorf("invalid public UDP port %d", publicAddr.Port)
 	}
 
 	// Pre-allocate: VER + REP + RSV + ATYP (4) + IP + PORT (2).
 	resp := make([]byte, 0, 4+len(ip)+2)
-	resp = append(resp, util.SocksVersion, 0x00, 0x00, addressType)
+	resp = append(resp, ss5.SocksVersion, 0x00, 0x00, addressType)
 	resp = append(resp, ip...)
 	resp = append(resp, port[:]...)
 
@@ -437,23 +432,27 @@ func udpAssociateReply(udpConn *net.UDPConn, publicIP net.IP) ([]byte, error) {
 // receiveUDPPackets owns the queues, association, timer and workers. It returns
 // after closing target sockets and waiting for every borrowed buffer to return.
 func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, controlIP netip.Addr) {
+	const (
+		forwardQueueWait = 100 * time.Microsecond
+		maxConcurrentUDP = 4
+		maxConcurrentDNS = 4
+	)
+
 	// Keep DNS waits away from IP and cached-domain traffic without reducing
 	// the concurrency available to independent target sockets.
 	jobs := make(chan udpPacketJob, 16)
-	const forwardQueueWait = 100 * time.Microsecond
 	var forwardTimer *time.Timer
 	dnsJobs := make(chan udpPacketJob, 16)
-	var workerWg sync.WaitGroup
-	const maxConcurrentUDP = 4
+	var workerWG sync.WaitGroup
 	for i := 0; i < maxConcurrentUDP; i++ {
-		workerWg.Add(1)
-		go s.udpPacketWorker(jobs, &workerWg)
+		workerWG.Add(1)
+		go s.udpPacketWorker(jobs, &workerWG)
 	}
-	const maxConcurrentDNS = 4
 	for i := 0; i < maxConcurrentDNS; i++ {
-		workerWg.Add(1)
-		go s.udpPacketWorker(dnsJobs, &workerWg)
+		workerWG.Add(1)
+		go s.udpPacketWorker(dnsJobs, &workerWG)
 	}
+
 	var allowedSrc netip.AddrPort
 	var assoc *udpAssociation
 	defer func() {
@@ -465,7 +464,7 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 		if assoc != nil {
 			assoc.Close()
 		}
-		workerWg.Wait()
+		workerWG.Wait()
 	}()
 
 	// Only accepted client packets and target replies count as activity.
@@ -473,12 +472,12 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 	_ = udpConn.SetReadDeadline(time.Now().Add(udpAssociationIdleTimeout))
 
 	for {
-		buffer := util.BorrowUDPBuffer()
+		buffer := ss5.BorrowUDPBuffer()
 		buf := *buffer
 
 		n, srcAddr, err := udpConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			util.ReturnUDPBuffer(buffer)
+			ss5.ReturnUDPBuffer(buffer)
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() && assoc != nil {
 				if remaining := assoc.activity.remaining(); remaining > 0 {
@@ -488,30 +487,32 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 			}
 			return
 		}
+
 		if !validUDPPacket(buf[:n]) {
-			util.ReturnUDPBuffer(buffer)
+			ss5.ReturnUDPBuffer(buffer)
 			continue
 		}
 
 		// Tie the UDP association to the TCP control connection's client IP.
 		// After the first accepted UDP datagram, pin the full UDP source tuple.
 		if !srcAddr.IsValid() {
-			util.ReturnUDPBuffer(buffer)
+			ss5.ReturnUDPBuffer(buffer)
 			continue
 		}
 		if srcAddr.Addr().Unmap().WithZone("") != controlIP {
-			util.ReturnUDPBuffer(buffer)
+			ss5.ReturnUDPBuffer(buffer)
 			continue
 		}
+
 		if !allowedSrc.IsValid() {
 			allowedSrc = srcAddr
 			assoc = newUDPAssociation(ctx, udpConn, net.UDPAddrFromAddrPort(srcAddr))
 			if assoc == nil {
-				util.ReturnUDPBuffer(buffer)
+				ss5.ReturnUDPBuffer(buffer)
 				continue
 			}
 		} else if srcAddr != allowedSrc {
-			util.ReturnUDPBuffer(buffer)
+			ss5.ReturnUDPBuffer(buffer)
 			continue
 		}
 
@@ -519,7 +520,7 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 
 		job := udpPacketJob{assoc: assoc, buf: buffer, n: n}
 		queue := jobs
-		if buf[3] == util.AtypDomain {
+		if buf[3] == ss5.AtypDomain {
 			host := string(buf[5 : 5+int(buf[4])])
 			if ip, cached := s.udpDNS.get(host, time.Now()); cached {
 				job.ip = ip
@@ -527,11 +528,13 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 				queue = dnsJobs
 			}
 		}
+
 		select {
 		case queue <- job:
 			continue
 		default:
 		}
+
 		if queue == jobs {
 			// Absorb short scheduling stalls without letting a blocked target
 			// hold up the receive loop indefinitely. DNS never waits here.
@@ -549,34 +552,36 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 			case <-forwardTimer.C:
 			}
 		}
-		util.ReturnUDPBuffer(buffer)
+
+		ss5.ReturnUDPBuffer(buffer)
 	}
 }
 
-// Reuses a fixed goroutine to process queued UDP packets, avoiding
-// per-datagram goroutine creation on the hot path.
-func (s *server) udpPacketWorker(jobs <-chan udpPacketJob, workerWg *sync.WaitGroup) {
-	defer workerWg.Done()
+// udpPacketWorker processes queued packets and returns each borrowed buffer.
+func (s *server) udpPacketWorker(jobs <-chan udpPacketJob, workerWG *sync.WaitGroup) {
+	defer workerWG.Done()
 	for job := range jobs {
 		if job.assoc.ctx.Err() == nil {
 			s.handleUDPPacket(job.assoc, *job.buf, job.n, job.ip)
 		}
-		util.ReturnUDPBuffer(job.buf)
+		ss5.ReturnUDPBuffer(job.buf)
 	}
 }
 
-// Validate the complete frame before pinning its source or refreshing activity.
+// validUDPPacket reports whether packet has a complete, unfragmented SOCKS5 UDP
+// header. Callers must validate it before pinning the source or refreshing activity.
 func validUDPPacket(packet []byte) bool {
 	if len(packet) < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
 		return false
 	}
+
 	var header int
 	switch packet[3] {
-	case util.AtypIPv4:
+	case ss5.AtypIPv4:
 		header = 10
-	case util.AtypIPv6:
+	case ss5.AtypIPv6:
 		header = 22
-	case util.AtypDomain:
+	case ss5.AtypDomain:
 		if len(packet) < 5 || packet[4] == 0 {
 			return false
 		}
@@ -587,39 +592,29 @@ func validUDPPacket(packet []byte) bool {
 	return len(packet) >= header
 }
 
-// Processes a single client UDP datagram: parses the SOCKS5 UDP header,
-// resolves the destination, and forwards the payload via the relay socket.
-//
-// Hot-path design (IPv4/IPv6 with existing relay):
-// 1. Build udpAddrKey directly from raw buffer bytes — zero heap allocations.
-// 2. Call lookupRelay(key) under a read lock — no net.UDPAddr constructed.
-// 3. Throttle SetWriteDeadline via atomic timestamp — at most one syscall per
-// writeDeadlineRefresh interval instead of one per datagram.
-//
-// Cold path (new relay or domain target): allocates net.UDPAddr and dials.
-func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resolvedIP net.IP) {
+// handleUDPPacket resolves the target and forwards one validated UDP datagram.
+// IP targets reuse existing relays without constructing a net.UDPAddr.
+func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resolvedIP netip.Addr) {
 	if assoc == nil {
 		return
 	}
+
 	// The caller validated the complete header, RSV/FRAG == 0, and source IP.
 	// A complete frame may carry a zero-length UDP payload.
 	addressType := buf[3]
 
-	// key is built from raw bytes without allocating a net.UDPAddr so that the
-	// frequent case (relay already exists) is entirely allocation-free.
 	var key udpAddrKey
 	var headerLen int
 
 	switch addressType {
-	case util.AtypIPv4:
+	case ss5.AtypIPv4:
 		if n < 10 {
 			return
 		}
 		key = ipv4KeyFromBytes(buf[4:8], binary.BigEndian.Uint16(buf[8:10]))
 		headerLen = 10
 
-	case util.AtypDomain:
-		// Domain targets use a small TTL cache to avoid resolving on every packet.
+	case ss5.AtypDomain:
 		if n < 5 {
 			return
 		}
@@ -627,11 +622,12 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 		if hostLen == 0 || 5+hostLen+2 > n {
 			return
 		}
-		host := string(buf[5 : 5+hostLen])
+
 		port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
 
 		ip := resolvedIP
-		if ip == nil {
+		if !ip.IsValid() {
+			host := string(buf[5 : 5+hostLen])
 			var err error
 			ip, err = s.resolveUDPHost(assoc.ctx, host)
 			if err != nil {
@@ -639,19 +635,26 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 				return
 			}
 		}
-		dstAddr := &net.UDPAddr{IP: ip, Port: port}
+
 		var ok bool
-		key, ok = makeUDPAddrKey(dstAddr)
+		key, ok = makeUDPAddrKey(ip, port)
 		if !ok {
-			log.Printf("UDP relay DNS lookup produced invalid target %v", dstAddr)
+			log.Printf("UDP relay DNS lookup produced invalid address %v", ip)
 			return
 		}
+
 		headerLen = 5 + hostLen + 2
 		payload := buf[headerLen:n]
+		if relay := assoc.lookupRelay(key); relay != nil {
+			s.writeUDPPayload(assoc, relay, payload)
+			return
+		}
+
+		dstAddr := &net.UDPAddr{IP: ip.AsSlice(), Port: port}
 		s.forwardUDPPayload(assoc, key, dstAddr, payload)
 		return
 
-	case util.AtypIPv6:
+	case ss5.AtypIPv6:
 		if n < 22 {
 			return
 		}
@@ -663,18 +666,16 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 	}
 
 	payload := buf[headerLen:n]
-
-	// Fast path: look up relay by key — no net.UDPAddr allocation.
 	relay := assoc.lookupRelay(key)
 	if relay == nil {
-		// Slow path: relay does not yet exist; construct dst and dial.
+		// Copy the address before retaining it beyond the borrowed packet buffer.
 		var dstAddr *net.UDPAddr
 		switch addressType {
-		case util.AtypIPv4:
+		case ss5.AtypIPv4:
 			ip := make(net.IP, net.IPv4len)
 			copy(ip, buf[4:8])
 			dstAddr = &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(buf[8:10]))}
-		case util.AtypIPv6:
+		case ss5.AtypIPv6:
 			ip := make(net.IP, net.IPv6len)
 			copy(ip, buf[4:20])
 			dstAddr = &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(buf[20:22]))}
@@ -686,7 +687,7 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 	s.writeUDPPayload(assoc, relay, payload)
 }
 
-// Obtains or creates the relay for (key, dst) and sends payload.
+// forwardUDPPayload obtains or creates a relay for dst and sends payload.
 func (s *server) forwardUDPPayload(assoc *udpAssociation, key udpAddrKey, dst *net.UDPAddr, payload []byte) {
 	relay, err := assoc.relayForKey(key, dst)
 	if err != nil {
@@ -695,14 +696,17 @@ func (s *server) forwardUDPPayload(assoc *udpAssociation, key udpAddrKey, dst *n
 		}
 		return
 	}
+
 	s.writeUDPPayload(assoc, relay, payload)
 }
 
-// Sends payload through relay, throttling SetWriteDeadline to at most once per
-// writeDeadlineRefresh to avoid updating the deadline on every datagram.
+// writeUDPPayload sends payload and periodically refreshes the write deadline.
+// Concurrent workers may refresh it together; each refresh is safe to repeat.
 func (s *server) writeUDPPayload(assoc *udpAssociation, relay *udpRelay, payload []byte) {
-	const writeDeadlineRefresh = int64(10 * time.Second)
-	const writeDeadlineDuration = 30 * time.Second
+	const (
+		writeDeadlineRefresh  = int64(10 * time.Second)
+		writeDeadlineDuration = 30 * time.Second
+	)
 
 	now := time.Now()
 	if now.UnixNano()-relay.lastWriteDeadline.Load() > writeDeadlineRefresh {
@@ -724,12 +728,13 @@ func (s *server) writeUDPPayload(assoc *udpAssociation, relay *udpRelay, payload
 	relay.activity.touch()
 }
 
-// Creates a udpAssociation for the given client UDP socket and address.
-// Returns nil if either argument is nil.
+// newUDPAssociation creates an association bound to clientConn and clientAddr.
+// It returns nil if the connection or address is nil.
 func newUDPAssociation(parent context.Context, clientConn *net.UDPConn, clientAddr *net.UDPAddr) *udpAssociation {
 	if clientConn == nil || clientAddr == nil {
 		return nil
 	}
+
 	ctx, cancel := context.WithCancel(parent)
 	return &udpAssociation{
 		clientConn: clientConn,
@@ -741,9 +746,7 @@ func newUDPAssociation(parent context.Context, clientConn *net.UDPConn, clientAd
 	}
 }
 
-// lookupRelay returns the existing relay for key under a read lock, or nil if none exists.
-// This is the zero-allocation fast path: the caller already built key from raw buffer
-// bytes, so no net.UDPAddr is allocated until a new relay actually needs to be dialled.
+// lookupRelay returns the relay for key under a read lock, or nil if none exists.
 func (a *udpAssociation) lookupRelay(key udpAddrKey) *udpRelay {
 	a.mu.RLock()
 	relay := a.relays[key]
@@ -751,12 +754,11 @@ func (a *udpAssociation) lookupRelay(key udpAddrKey) *udpRelay {
 	return relay
 }
 
-// Returns the existing relay for the pre-computed key or creates a new one by dialling dst.
-// Safe for concurrent use; uses double-checked locking to minimise lock contention.
-// The caller supplies the key to avoid recomputing it on every datagram.
+// relayForKey returns an existing relay or dials dst within the relay quotas.
+// Concurrent calls may dial the same target; only one relay is retained.
 func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRelay, error) {
 	if a == nil {
-		return nil, errors.New("nil udp association")
+		return nil, errors.New("nil UDP association")
 	}
 	if dst == nil {
 		return nil, errors.New("nil relay target address")
@@ -767,12 +769,13 @@ func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRela
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
-		return nil, errors.New("udp association closed")
+		return nil, errors.New("UDP association closed")
 	}
 	if relay := a.relays[key]; relay != nil {
 		a.mu.Unlock()
 		return relay, nil
 	}
+
 	if len(a.relays)+a.pending >= maxRelaysPerAssociation {
 		a.mu.Unlock()
 		return nil, errUDPRelayLimit
@@ -786,6 +789,7 @@ func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRela
 	a.pending++
 	a.wg.Add(1)
 	a.mu.Unlock()
+
 	started := false
 	defer func() {
 		a.mu.Lock()
@@ -796,25 +800,31 @@ func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRela
 			a.wg.Done()
 		}
 	}()
+
 	conn, err := net.DialUDP("udp", nil, dst)
 	if err != nil {
 		return nil, err
 	}
+
 	header, ok := buildUDPResponseHeader(dst)
 	if !ok {
 		_ = conn.Close()
-		return nil, errors.New("invalid udp relay target address")
+		return nil, errors.New("invalid UDP relay target address")
 	}
 	relay := &udpRelay{
-		assoc: a, key: key, target: cloneUDPAddr(dst),
-		responseHeader: header, conn: conn,
-		activity: idleClock{start: time.Now()},
+		assoc:          a,
+		key:            key,
+		target:         cloneUDPAddr(dst),
+		responseHeader: header,
+		conn:           conn,
+		activity:       idleClock{start: time.Now()},
 	}
+
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
 		_ = conn.Close()
-		return nil, errors.New("udp association closed")
+		return nil, errors.New("UDP association closed")
 	}
 	if existing := a.relays[key]; existing != nil {
 		a.mu.Unlock()
@@ -824,15 +834,17 @@ func (a *udpAssociation) relayForKey(key udpAddrKey, dst *net.UDPAddr) (*udpRela
 	a.relays[key] = relay
 	started = true
 	a.mu.Unlock()
+
 	go relay.readLoop()
 	return relay, nil
 }
 
-// Removes relay from the association's map only if it is still the current entry.
+// removeRelay removes relay only if it is still the current entry for key.
 func (a *udpAssociation) removeRelay(key udpAddrKey, relay *udpRelay) {
 	if a == nil {
 		return
 	}
+
 	a.mu.Lock()
 	if current, ok := a.relays[key]; ok && current == relay {
 		delete(a.relays, key)
@@ -840,11 +852,12 @@ func (a *udpAssociation) removeRelay(key udpAddrKey, relay *udpRelay) {
 	a.mu.Unlock()
 }
 
-// Closes all relay connections and waits for their goroutines to finish.
+// Close cancels DNS waits, closes relays and waits for pending dials and relays.
 func (a *udpAssociation) Close() {
 	if a == nil {
 		return
 	}
+
 	a.cancel()
 	a.mu.Lock()
 	a.closed = true
@@ -852,7 +865,7 @@ func (a *udpAssociation) Close() {
 	for _, relay := range a.relays {
 		relays = append(relays, relay)
 	}
-	a.relays = make(map[udpAddrKey]*udpRelay)
+	a.relays = nil
 	a.mu.Unlock()
 
 	for _, relay := range relays {
@@ -861,16 +874,18 @@ func (a *udpAssociation) Close() {
 	a.wg.Wait()
 }
 
-// Reads datagrams from the remote target and forwards them back to the client.
+// readLoop forwards target replies until the relay closes or expires.
 func (r *udpRelay) readLoop() {
 	if r.assoc == nil {
 		return
 	}
 	defer r.assoc.wg.Done()
 	defer func() { <-udpRelaySlots }()
-	buffer := util.BorrowUDPBuffer()
-	defer util.ReturnUDPBuffer(buffer)
+
+	buffer := ss5.BorrowUDPBuffer()
+	defer ss5.ReturnUDPBuffer(buffer)
 	packetBuf := *buffer
+
 	headerLen := len(r.responseHeader)
 	if headerLen == 0 || headerLen >= len(packetBuf) {
 		log.Printf("UDP relay: invalid response header length %d for %s", headerLen, r.target)
@@ -880,8 +895,10 @@ func (r *udpRelay) readLoop() {
 	}
 	copy(packetBuf[:headerLen], r.responseHeader)
 
-	const writeDeadline = 30 * time.Second
-	const writeDeadlineRefresh = 10 * time.Second
+	const (
+		writeDeadline        = 30 * time.Second
+		writeDeadlineRefresh = 10 * time.Second
+	)
 	now := time.Now()
 	_ = r.conn.SetReadDeadline(now.Add(udpAssociationIdleTimeout))
 	_ = r.assoc.clientConn.SetWriteDeadline(now.Add(writeDeadline))
@@ -903,9 +920,9 @@ func (r *udpRelay) readLoop() {
 			r.close()
 			return
 		}
+
 		r.activity.touch()
 		now = time.Now()
-
 		total := headerLen + nRead
 
 		// Refresh the write deadline periodically so a slow client does not
@@ -924,11 +941,12 @@ func (r *udpRelay) readLoop() {
 	}
 }
 
-// Closes the relay's UDP connection exactly once.
+// close closes the relay socket exactly once.
 func (r *udpRelay) close() {
 	if r == nil {
 		return
 	}
+
 	r.closeOnce.Do(func() {
 		if r.conn != nil {
 			_ = r.conn.Close()
@@ -936,7 +954,8 @@ func (r *udpRelay) close() {
 	})
 }
 
-// Relative monotonic time avoids wall-clock adjustments affecting expiration.
+// idleClock tracks activity using monotonic time so wall-clock changes do not
+// affect expiration. It is safe for concurrent use after start is initialized.
 type idleClock struct {
 	start time.Time
 	last  atomic.Int64
@@ -961,20 +980,21 @@ const (
 )
 
 type dnsCacheEntry struct {
-	ip        net.IP
+	ip        netip.Addr
 	expiresAt time.Time
 }
 
 type dnsLookupCall struct {
+	// Closing done publishes ip and err to waiters.
 	done    chan struct{}
 	cancel  context.CancelFunc
 	waiters int // Protected by dnsCache.mu.
-	ip      net.IP
+	ip      netip.Addr
 	err     error
 }
 
-// dnsCache caches UDP domain resolutions so repeated ATYP=DOMAIN packets do not
-// synchronously hit the resolver on every datagram.
+// dnsCache shares UDP domain lookups and caches successful results for a fixed TTL.
+// It is safe for concurrent use after initialization with newDNSCache.
 type dnsCache struct {
 	mu       sync.RWMutex
 	entries  map[string]dnsCacheEntry
@@ -988,12 +1008,12 @@ func newDNSCache() *dnsCache {
 	}
 }
 
-// Resolves a UDP target hostname with a small in-memory TTL cache tuned for
-// the UDP relay hot path.
-func (s *server) resolveUDPHost(parent context.Context, host string) (net.IP, error) {
+// resolveUDPHost returns a cached IP or joins a shared lookup for host.
+func (s *server) resolveUDPHost(parent context.Context, host string) (netip.Addr, error) {
 	if err := parent.Err(); err != nil {
-		return nil, err
+		return netip.Addr{}, err
 	}
+
 	now := time.Now()
 	if ip, ok := s.udpDNS.get(host, now); ok {
 		return ip, nil
@@ -1001,10 +1021,11 @@ func (s *server) resolveUDPHost(parent context.Context, host string) (net.IP, er
 
 	s.udpDNS.mu.Lock()
 	if entry, ok := s.udpDNS.entries[host]; ok && entry.expiresAt.After(now) {
-		ip := cloneIP(entry.ip)
+		ip := entry.ip
 		s.udpDNS.mu.Unlock()
 		return ip, nil
 	}
+
 	call := s.udpDNS.inflight[host]
 	if call == nil {
 		// A lookup belongs to all its waiters, not to the first association.
@@ -1021,41 +1042,45 @@ func (s *server) resolveUDPHost(parent context.Context, host string) (net.IP, er
 		call.waiters--
 		if call.waiters == 0 {
 			call.cancel()
-			// A later caller must not join a lookup that has been cancelled.
+			// A later caller must not join a lookup that has been canceled.
 			if s.udpDNS.inflight[host] == call {
 				delete(s.udpDNS.inflight, host)
 			}
 		}
 		s.udpDNS.mu.Unlock()
 	}()
+
 	select {
 	case <-parent.Done():
-		return nil, parent.Err()
+		return netip.Addr{}, parent.Err()
 	case <-call.done:
-		return cloneIP(call.ip), call.err
+		return call.ip, call.err
 	}
 }
 
-// Resolves once for all waiters. The query stops after five seconds or when
-// its last waiter leaves; one association closing cannot cancel another's work.
+// lookupUDPHost resolves host for all waiters and publishes the result.
+// The query stops after five seconds or when its last waiter leaves.
 func (s *server) lookupUDPHost(ctx context.Context, host string, call *dnsLookupCall) {
 	defer call.cancel()
+
 	ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	var resolvedIP net.IP
+	var resolvedIP netip.Addr
 	if err == nil {
 		for _, ipAddr := range ipAddrs {
-			if ipAddr.IP != nil {
-				resolvedIP = cloneIP(ipAddr.IP)
+			if ip, ok := netip.AddrFromSlice(ipAddr.IP); ok {
+				resolvedIP = ip.Unmap()
 				break
 			}
 		}
-		if resolvedIP == nil {
-			err = errors.New("no ip address found")
+		if !resolvedIP.IsValid() {
+			err = errors.New("no IP address found")
 		}
 	}
+
 	if err == nil {
 		s.udpDNS.put(host, resolvedIP, time.Now())
 	}
+
 	s.udpDNS.mu.Lock()
 	if s.udpDNS.inflight[host] == call {
 		delete(s.udpDNS.inflight, host)
@@ -1065,15 +1090,17 @@ func (s *server) lookupUDPHost(ctx context.Context, host string, call *dnsLookup
 	s.udpDNS.mu.Unlock()
 }
 
-func (c *dnsCache) get(host string, now time.Time) (net.IP, bool) {
+// get returns an unexpired cached address by value, or false on a miss.
+func (c *dnsCache) get(host string, now time.Time) (netip.Addr, bool) {
 	if c == nil || host == "" {
-		return nil, false
+		return netip.Addr{}, false
 	}
+
 	c.mu.RLock()
 	entry, ok := c.entries[host]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, false
+		return netip.Addr{}, false
 	}
 	if !entry.expiresAt.After(now) {
 		c.mu.Lock()
@@ -1081,26 +1108,31 @@ func (c *dnsCache) get(host string, now time.Time) (net.IP, bool) {
 			delete(c.entries, host)
 		}
 		c.mu.Unlock()
-		return nil, false
+		return netip.Addr{}, false
 	}
-	return cloneIP(entry.ip), true
+	return entry.ip, true
 }
 
-func (c *dnsCache) put(host string, ip net.IP, now time.Time) {
-	if c == nil || host == "" || ip == nil {
+// put caches ip, evicting entries only when a new host needs space.
+func (c *dnsCache) put(host string, ip netip.Addr, now time.Time) {
+	if c == nil || host == "" || !ip.IsValid() {
 		return
 	}
+
 	entry := dnsCacheEntry{
-		ip:        cloneIP(ip),
+		ip:        ip.Unmap(),
 		expiresAt: now.Add(udpDNSCacheTTL),
 	}
+
 	c.mu.Lock()
-	if len(c.entries) >= udpDNSCacheMaxEntries {
+	_, exists := c.entries[host]
+	if !exists && len(c.entries) >= udpDNSCacheMaxEntries {
 		for key, existing := range c.entries {
 			if !existing.expiresAt.After(now) {
 				delete(c.entries, key)
 			}
 		}
+
 		if len(c.entries) >= udpDNSCacheMaxEntries {
 			for key := range c.entries {
 				delete(c.entries, key)
@@ -1112,40 +1144,29 @@ func (c *dnsCache) put(host string, ip net.IP, now time.Time) {
 	c.mu.Unlock()
 }
 
-func cloneIP(ip net.IP) net.IP {
-	if ip == nil {
-		return nil
-	}
-	return append(net.IP(nil), ip...)
-}
-
 const maxPortNumber = 65535
 
-// udpAddrKey is a compact, hashable representation of a UDP address used as
-// the relay map key. A fixed-size array avoids the heap allocation that
-// net.UDPAddr.String() would incur on every lookup in the hot relay path.
-// Bytes 0-15 hold the IPv4-in-IPv6 form of the IP (via To16()); bytes 16-17
-// hold the port in big-endian. Zone is omitted: link-local scoped addresses
-// are not expected in a SOCKS5 proxy relay.
+// udpAddrKey is a relay map key containing a 16-byte IP and a big-endian port.
+// IPv4 addresses use the IPv4-mapped IPv6 form. Zones are omitted because SOCKS5
+// address fields cannot represent IPv6 scope zones.
 type udpAddrKey [18]byte
 
-// Converts a *net.UDPAddr to its compact key without any heap allocation.
-// Returns false if addr is nil, has no IP, or has an invalid port.
-func makeUDPAddrKey(addr *net.UDPAddr) (udpAddrKey, bool) {
-	var k udpAddrKey
-	if addr == nil || addr.IP == nil || addr.Port < 0 || addr.Port > maxPortNumber {
-		return k, false
+// makeUDPAddrKey encodes ip and port as a relay key.
+// It returns false if the address or port is invalid.
+func makeUDPAddrKey(ip netip.Addr, port int) (udpAddrKey, bool) {
+	var key udpAddrKey
+	if !ip.IsValid() || port < 0 || port > maxPortNumber {
+		return key, false
 	}
-	if ip16 := addr.IP.To16(); ip16 != nil {
-		copy(k[:16], ip16)
-	}
-	binary.BigEndian.PutUint16(k[16:], uint16(addr.Port))
-	return k, true
+
+	ip16 := ip.As16()
+	copy(key[:16], ip16[:])
+	binary.BigEndian.PutUint16(key[16:], uint16(port))
+	return key, true
 }
 
-// Builds a udpAddrKey directly from a raw 4-byte IPv4 slice and port, matching
-// the IPv4-mapped IPv6 encoding that net.IP.To16() produces. Avoids allocating
-// a net.IP or net.UDPAddr in the hot UDP relay path.
+// ipv4KeyFromBytes encodes the first four bytes of ip4 and port as a relay key.
+// The address uses the IPv4-mapped IPv6 form, matching net.IP.To16.
 func ipv4KeyFromBytes(ip4 []byte, port uint16) udpAddrKey {
 	var k udpAddrKey
 	// IPv4-mapped IPv6 prefix: 10 zero bytes, then 0xff 0xff, then the 4 IPv4 bytes.
@@ -1156,8 +1177,7 @@ func ipv4KeyFromBytes(ip4 []byte, port uint16) udpAddrKey {
 	return k
 }
 
-// Builds a udpAddrKey directly from a raw 16-byte IPv6 slice and port,
-// avoiding allocation in the hot UDP relay path.
+// ipv6KeyFromBytes encodes the first 16 bytes of ip6 and port as a relay key.
 func ipv6KeyFromBytes(ip6 []byte, port uint16) udpAddrKey {
 	var k udpAddrKey
 	copy(k[:16], ip6[:16])
@@ -1165,9 +1185,8 @@ func ipv6KeyFromBytes(ip6 []byte, port uint16) udpAddrKey {
 	return k
 }
 
-// Builds the fixed SOCKS5 UDP response header for dst.
-// The payload is written separately after this header on the hot path so
-// relay responses avoid an extra payload copy.
+// buildUDPResponseHeader returns a SOCKS5 UDP header for dst, or false if invalid.
+// Relays reuse the header and read payloads directly into the space after it.
 func buildUDPResponseHeader(dst *net.UDPAddr) ([]byte, bool) {
 	if dst == nil || dst.IP == nil {
 		return nil, false
@@ -1178,8 +1197,9 @@ func buildUDPResponseHeader(dst *net.UDPAddr) ([]byte, bool) {
 
 	if ip4 := dst.IP.To4(); ip4 != nil {
 		header := make([]byte, 0, 3+1+len(ip4)+2)
-		header = append(header, 0x00, 0x00, 0x00, util.AtypIPv4)
+		header = append(header, 0x00, 0x00, 0x00, ss5.AtypIPv4)
 		header = append(header, ip4...)
+
 		var port [2]byte
 		if !putPort(port[:], dst.Port) {
 			return nil, false
@@ -1192,9 +1212,11 @@ func buildUDPResponseHeader(dst *net.UDPAddr) ([]byte, bool) {
 	if ip6 == nil {
 		return nil, false
 	}
+
 	header := make([]byte, 0, 3+1+len(ip6)+2)
-	header = append(header, 0x00, 0x00, 0x00, util.AtypIPv6)
+	header = append(header, 0x00, 0x00, 0x00, ss5.AtypIPv6)
 	header = append(header, ip6...)
+
 	var port [2]byte
 	if !putPort(port[:], dst.Port) {
 		return nil, false
@@ -1203,8 +1225,8 @@ func buildUDPResponseHeader(dst *net.UDPAddr) ([]byte, bool) {
 	return header, true
 }
 
-// Encodes port into dst in network byte order.
-// Returns false if port is outside the valid TCP/UDP port range or dst is too small.
+// putPort writes port to dst in network byte order.
+// It reports whether port is valid and dst has at least two bytes.
 func putPort(dst []byte, port int) bool {
 	if len(dst) < 2 || port < 0 || port > maxPortNumber {
 		return false
@@ -1213,11 +1235,12 @@ func putPort(dst []byte, port int) bool {
 	return true
 }
 
-// Returns a deep copy of addr, or nil if addr is nil.
+// cloneUDPAddr returns a deep copy of addr, or nil if addr is nil.
 func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 	if addr == nil {
 		return nil
 	}
+
 	clone := &net.UDPAddr{Port: addr.Port, Zone: addr.Zone}
 	if addr.IP != nil {
 		clone.IP = append(net.IP(nil), addr.IP...)
@@ -1225,7 +1248,8 @@ func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 	return clone
 }
 
-// Returns a wildcard UDP bind address for the same IP family as ip.
+// udpWildcardAddrFor returns a wildcard bind address in the same family as ip.
+// Nil and invalid addresses default to IPv4.
 func udpWildcardAddrFor(ip net.IP) *net.UDPAddr {
 	if ip != nil && ip.To4() == nil && ip.To16() != nil {
 		return &net.UDPAddr{IP: append(net.IP(nil), net.IPv6zero...)}
@@ -1233,8 +1257,7 @@ func udpWildcardAddrFor(ip net.IP) *net.UDPAddr {
 	return &net.UDPAddr{IP: append(net.IP(nil), net.IPv4zero...)}
 }
 
-// Builds the public UDP address to advertise to clients,
-// pairing the given IP with the OS-assigned port.
+// udpPublicAddrFor copies localIP and pairs it with the bound UDP port.
 func udpPublicAddrFor(localIP net.IP, port int) *net.UDPAddr {
 	addr := &net.UDPAddr{Port: port}
 	if localIP != nil {
@@ -1249,13 +1272,13 @@ func main() {
 	flag.Parse()
 
 	confPath = filepath.Clean(confPath)
-	bytes, err := os.ReadFile(confPath)
+	data, err := os.ReadFile(confPath)
 	if err != nil {
 		log.Fatalf("The server failed to read the configuration file: %v", err)
 	}
 
 	var config Config
-	if err := json.Unmarshal(bytes, &config); err != nil {
+	if err := json.Unmarshal(data, &config); err != nil {
 		log.Fatalf("The server failed to parse the configuration file %s: %v", confPath, err)
 	}
 
@@ -1272,17 +1295,17 @@ func main() {
 		log.Fatalf("Configuration field client_pem is required")
 	}
 
-	var auth *util.Credentials
+	var auth *ss5.Credentials
 	if config.Username != "" || config.Password != "" {
-		auth = &util.Credentials{Username: config.Username, Password: config.Password}
+		auth = &ss5.Credentials{Username: config.Username, Password: config.Password}
 		if err := auth.Validate(); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	s := NewServer(config.ListenAddr, config.PublicAddr, config.ServerPEM, config.ServerKey, config.ClientPEM)
-	if s == nil {
-		log.Fatalf("Failed to create server")
+	s, err := NewServer(config.ListenAddr, config.PublicAddr, config.ServerPEM, config.ServerKey, config.ClientPEM)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
 	}
 
 	s.Auth = auth

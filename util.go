@@ -30,18 +30,20 @@ const (
 	AtypIPv6        byte = 0x04
 )
 
-// Holds the shared configuration embedded by both the client and server.
+// Service holds the listener address and optional SOCKS5 credentials shared by
+// the client and server. A nil Auth disables SOCKS5 username/password authentication.
 type Service struct {
 	ListenAddr *net.TCPAddr
 	Auth       *Credentials
 }
 
-// Credentials are exchanged only inside the existing authenticated TLS channel.
+// Credentials holds a SOCKS5 username and password for use over authenticated TLS.
 type Credentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
+// Validate checks that the username and password each contain 1 to 255 bytes.
 func (c Credentials) Validate() error {
 	if len(c.Username) < 1 || len(c.Username) > 255 || len(c.Password) < 1 || len(c.Password) > 255 {
 		return errors.New("SOCKS5 username and password must each contain 1 to 255 bytes")
@@ -59,6 +61,7 @@ func NegotiateServer(conn io.ReadWriter, auth *Credentials) error {
 		}
 		method = 2
 	}
+
 	var header [2]byte
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
 		return err
@@ -66,6 +69,7 @@ func NegotiateServer(conn io.ReadWriter, auth *Credentials) error {
 	if header[0] != SocksVersion || header[1] == 0 {
 		return errors.New("invalid SOCKS5 greeting")
 	}
+
 	var methods [255]byte
 	if _, err := io.ReadFull(conn, methods[:int(header[1])]); err != nil {
 		return err
@@ -82,6 +86,7 @@ func NegotiateServer(conn io.ReadWriter, auth *Credentials) error {
 	if auth == nil {
 		return nil
 	}
+
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
 		return err
 	}
@@ -89,11 +94,13 @@ func NegotiateServer(conn io.ReadWriter, auth *Credentials) error {
 		_ = WriteAll(conn, []byte{1, 1})
 		return errors.New("invalid SOCKS5 authentication request")
 	}
+
 	var username, password [255]byte
 	nu := int(header[1])
 	if _, err := io.ReadFull(conn, username[:nu]); err != nil {
 		return err
 	}
+
 	if _, err := io.ReadFull(conn, header[:1]); err != nil {
 		return err
 	}
@@ -105,6 +112,7 @@ func NegotiateServer(conn io.ReadWriter, auth *Credentials) error {
 	if _, err := io.ReadFull(conn, password[:np]); err != nil {
 		return err
 	}
+
 	gotUser, wantUser := sha256.Sum256(username[:nu]), sha256.Sum256([]byte(auth.Username))
 	gotPass, wantPass := sha256.Sum256(password[:np]), sha256.Sum256([]byte(auth.Password))
 	ok := subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) & subtle.ConstantTimeCompare(gotPass[:], wantPass[:])
@@ -124,6 +132,7 @@ func NegotiateClient(conn io.ReadWriter, auth *Credentials) error {
 		}
 		method = 2
 	}
+
 	if err := WriteAll(conn, []byte{SocksVersion, 1, method}); err != nil {
 		return err
 	}
@@ -137,6 +146,7 @@ func NegotiateClient(conn io.ReadWriter, auth *Credentials) error {
 	if auth == nil {
 		return nil
 	}
+
 	request := make([]byte, 0, 3+len(auth.Username)+len(auth.Password))
 	request = append(request, 1, byte(len(auth.Username)))
 	request = append(request, auth.Username...)
@@ -145,6 +155,7 @@ func NegotiateClient(conn io.ReadWriter, auth *Credentials) error {
 	if err := WriteAll(conn, request); err != nil {
 		return err
 	}
+
 	if _, err := io.ReadFull(conn, reply[:]); err != nil {
 		return err
 	}
@@ -154,21 +165,19 @@ func NegotiateClient(conn io.ReadWriter, auth *Credentials) error {
 	return nil
 }
 
-// Stores one parsed SOCKS5 target address without forcing domain names to be
-// resolved during protocol parsing.
+// socksTargetAddr holds a SOCKS5 target without resolving domain names.
 type socksTargetAddr struct {
-	atyp byte
 	host string
 	ip   net.IP
 	port int
 }
 
-// Returns the internal SOCKS5 address flavor.
+// Network returns "socks5".
 func (a *socksTargetAddr) Network() string {
 	return "socks5"
 }
 
-// Formats the target as host:port or ip:port for dialing/logging.
+// String returns the target in host:port form, or an empty string for a nil receiver.
 func (a *socksTargetAddr) String() string {
 	if a == nil {
 		return ""
@@ -180,103 +189,92 @@ func (a *socksTargetAddr) String() string {
 	return net.JoinHostPort(host, strconv.Itoa(a.port))
 }
 
-// Reads and validates the SOCKS5 handshake from a TLS connection,
-// returning the target address and the requested command (CmdConnect or CmdUDPAssociate).
-func (s *Service) ParseSOCKS5FromTLS(cliConn net.Conn) (net.Addr, byte, error) {
-	buf := socks5Pool.Get()
-	defer socks5Pool.Put(buf)
-
-	if err := NegotiateServer(cliConn, s.Auth); err != nil {
+// ParseSOCKS5FromTLS authenticates the client and reads one SOCKS5 request.
+// It returns the target address and command without consuming application data.
+func (s *Service) ParseSOCKS5FromTLS(clientConn net.Conn) (net.Addr, byte, error) {
+	if err := NegotiateServer(clientConn, s.Auth); err != nil {
 		return nil, 0, err
 	}
 
-	// Phase 2: Read the connection request header (VER, CMD, RSV, ATYP).
-	if _, err := io.ReadFull(cliConn, buf[:4]); err != nil {
+	buffer := socks5Pool.Get()
+	defer socks5Pool.Put(buffer)
+	buf := *buffer
+
+	// The request header contains VER, CMD, RSV and ATYP (RFC 1928).
+	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
 		return nil, 0x00, fmt.Errorf("failed to read SOCKS5 request header: %w", err)
 	}
-
 	if buf[0] != SocksVersion {
-		SendSOCKS5Reply(cliConn, 0x01) /* 0x01 = general SOCKS server failure */
+		SendSOCKS5Reply(clientConn, 0x01) // 0x01 = general SOCKS server failure
 		return nil, 0x00, fmt.Errorf("unsupported SOCKS5 version in request: 0x%02x", buf[0])
 	}
 	// RSV must be 0x00 per RFC 1928.
 	if buf[2] != 0x00 {
-		SendSOCKS5Reply(cliConn, 0x01)
+		SendSOCKS5Reply(clientConn, 0x01)
 		return nil, 0x00, fmt.Errorf("SOCKS5 request has non-zero RSV field: 0x%02x", buf[2])
 	}
 
 	cmd := buf[1]
-	// CMD: 0x01=CONNECT, 0x03=UDP ASSOCIATE.
 	if cmd != CmdConnect && cmd != CmdUDPAssociate {
-		SendSOCKS5Reply(cliConn, 0x07) /* 0x07 = command not supported */
+		SendSOCKS5Reply(clientConn, 0x07) // 0x07 = command not supported
 		return nil, 0x00, fmt.Errorf("unsupported SOCKS5 command: 0x%02x", cmd)
 	}
 
 	target := &socksTargetAddr{}
-
 	switch buf[3] {
-	case AtypIPv4: /* IPv4: 4 bytes. */
-		if _, err := io.ReadFull(cliConn, buf[:4+2]); err != nil {
+	case AtypIPv4:
+		if _, err := io.ReadFull(clientConn, buf[:4+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read IPv4 address and port: %w", err)
 		}
 		// Copy IP and port immediately: buf is pooled and must not be referenced after return.
 		ip4 := make(net.IP, net.IPv4len)
 		copy(ip4, buf[:4])
-		target.atyp = AtypIPv4
 		target.ip = ip4
 		target.port = int(binary.BigEndian.Uint16(buf[4:6]))
 
-	case AtypDomain: /* Domain name. */
-		if _, err := io.ReadFull(cliConn, buf[:1]); err != nil {
+	case AtypDomain:
+		if _, err := io.ReadFull(clientConn, buf[:1]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read domain length: %w", err)
 		}
 		domainLen := int(buf[0])
 		if domainLen == 0 {
-			SendSOCKS5Reply(cliConn, 0x01)
+			SendSOCKS5Reply(clientConn, 0x01)
 			return nil, 0x00, errors.New("SOCKS5 domain address has zero length")
 		}
 
-		// Read domain + 2 bytes port.
-		if _, err := io.ReadFull(cliConn, buf[:domainLen+2]); err != nil {
+		if _, err := io.ReadFull(clientConn, buf[:domainLen+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read domain and port: %w", err)
 		}
-
-		target.atyp = AtypDomain
 		target.host = string(buf[:domainLen])
 		target.port = int(binary.BigEndian.Uint16(buf[domainLen : domainLen+2]))
 
-	case AtypIPv6: /* IPv6: 16 bytes. */
-		if _, err := io.ReadFull(cliConn, buf[:16+2]); err != nil {
+	case AtypIPv6:
+		if _, err := io.ReadFull(clientConn, buf[:16+2]); err != nil {
 			return nil, 0x00, fmt.Errorf("failed to read IPv6 address and port: %w", err)
 		}
 		// Copy IP and port immediately: buf is pooled and must not be referenced after return.
 		ip6 := make(net.IP, net.IPv6len)
 		copy(ip6, buf[:16])
-		target.atyp = AtypIPv6
 		target.ip = ip6
 		target.port = int(binary.BigEndian.Uint16(buf[16:18]))
 
 	default:
-		SendSOCKS5Reply(cliConn, 0x08) /* 0x08 = address type not supported */
+		SendSOCKS5Reply(clientConn, 0x08) // 0x08 = address type not supported
 		return nil, 0x00, fmt.Errorf("unknown address type: 0x%02x", buf[3])
-	}
-
-	if target.host == "" && target.ip == nil {
-		SendSOCKS5Reply(cliConn, 0x01)
-		return nil, 0x00, errors.New("empty SOCKS5 target address")
 	}
 
 	return target, cmd, nil
 }
 
-// Sends a SOCKS5 reply with the given reply code.
+// SendSOCKS5Reply sends rep with an unspecified IPv4 bind address.
+// It ignores write errors because callers use it before closing failed requests.
 func SendSOCKS5Reply(conn net.Conn, rep byte) {
-	// Use a stack-allocated array to avoid a heap allocation on the error path.
 	reply := [10]byte{SocksVersion, rep, 0x00, AtypIPv4}
 	_ = WriteAll(conn, reply[:])
 }
 
-// Writes all bytes in buf to conn, looping until all bytes are written.
+// WriteAll writes all bytes in buf to conn or returns the first write error.
+// It returns io.ErrShortWrite if a write returns no bytes and no error.
 func WriteAll(conn io.Writer, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
@@ -293,16 +291,17 @@ func WriteAll(conn io.Writer, buf []byte) error {
 	return nil
 }
 
-// The buffer size used to relay TCP data.
+// ConnectionBuffer is the size in bytes of a TCP relay buffer.
 const ConnectionBuffer = 64 * 1024
 
-// The buffer size used to relay UDP payloads.
+// UDPBuffer is the size in bytes of a UDP relay buffer.
 const UDPBuffer = 64 * 1024
 
-// The buffer size used to parse SOCKS5 handshakes.
-const Socks5Buffer = 8 * 1024
+// Socks5Buffer is the size in bytes of a SOCKS5 parsing buffer.
+// The parser reuses it for the header and for up to 255 domain bytes plus a port.
+const Socks5Buffer = 255 + 2
 
-// Reuses fixed-size buffers without repeated allocations.
+// bufferPool reuses fixed-size byte slices and is safe for concurrent use.
 type bufferPool struct {
 	pool sync.Pool
 	size int
@@ -314,7 +313,7 @@ var (
 	socks5Pool = newBufferPool(Socks5Buffer)
 )
 
-// Creates a pool of fixed-size byte slices. size must be positive.
+// newBufferPool returns a pool of size-byte buffers. It panics if size is not positive.
 func newBufferPool(size int) *bufferPool {
 	if size <= 0 {
 		panic("bufferPool: size must be positive")
@@ -330,48 +329,37 @@ func newBufferPool(size int) *bufferPool {
 	}
 }
 
-// Pulls one buffer from the pool.
-func (p *bufferPool) Get() []byte {
-	return *p.pool.Get().(*[]byte)
+// Get returns a pooled slice header and its fixed-size backing array.
+// The caller must return the same pointer with Put after use.
+func (p *bufferPool) Get() *[]byte {
+	return p.pool.Get().(*[]byte)
 }
 
-// Returns buf to the pool. Buffers of the wrong capacity are discarded.
-// Only return buffers of the correct capacity to avoid memory bloat.
-// Reslice to full capacity so the next Get returns the full buffer.
-func (p *bufferPool) Put(buf []byte) {
-	if cap(buf) == p.size {
-		buf = buf[:cap(buf)]
-		p.pool.Put(&buf)
+// Put returns buf to the pool, restoring its length to the configured size.
+// Nil pointers and buffers with a different capacity are discarded.
+func (p *bufferPool) Put(buf *[]byte) {
+	if buf != nil && cap(*buf) == p.size {
+		*buf = (*buf)[:p.size]
+		p.pool.Put(buf)
 	}
 }
 
-// Returns a buffer from the UDP pool sized for a maximum UDP datagram.
-func GetUDPBuffer() []byte {
+// BorrowUDPBuffer returns a pooled slice header and its UDPBuffer-byte backing array.
+// Ownership transfers with the pointer; return it exactly once with ReturnUDPBuffer.
+func BorrowUDPBuffer() *[]byte {
 	return udpPool.Get()
 }
 
-// Returns a buffer obtained via GetUDPBuffer back to the pool.
-func PutUDPBuffer(buf []byte) {
+// ReturnUDPBuffer returns a buffer obtained from BorrowUDPBuffer to the pool.
+// The caller must not use the buffer or its slice after returning it.
+func ReturnUDPBuffer(buf *[]byte) {
 	udpPool.Put(buf)
 }
 
-// BorrowUDPBuffer retains the pooled slice header as well as its backing array.
-// Transfer ownership with the pointer and return it exactly once after use.
-// Unlike GetUDPBuffer/PutUDPBuffer, this avoids allocating a new header per packet.
-func BorrowUDPBuffer() *[]byte {
-	return udpPool.pool.Get().(*[]byte)
-}
-
-func ReturnUDPBuffer(buf *[]byte) {
-	if buf != nil && cap(*buf) == UDPBuffer {
-		*buf = (*buf)[:UDPBuffer]
-		udpPool.pool.Put(buf)
-	}
-}
-
-const relayIdleTimeout = 5 * time.Minute
-
-const relayWriteTimeout = 30 * time.Second
+const (
+	relayIdleTimeout  = 5 * time.Minute
+	relayWriteTimeout = 30 * time.Second
+)
 
 // ConfigureTCPConn applies the TCP settings shared by accepted clients and targets.
 // Socket options are best effort and do not abort connection setup on failure.
@@ -409,10 +397,16 @@ func RelayClient(a, b net.Conn) error {
 
 func relay(a, b net.Conn, idleTimeout time.Duration) error {
 	var once sync.Once
-	closeBoth := func() { once.Do(func() { CloseConnection(a); CloseConnection(b) }) }
+	closeBoth := func() {
+		once.Do(func() {
+			CloseConnection(a)
+			CloseConnection(b)
+		})
+	}
 	defer closeBoth()
 	_ = a.SetDeadline(time.Time{})
 	_ = b.SetDeadline(time.Time{})
+
 	start := time.Now()
 	var activity atomic.Int64
 	touch := func() {
@@ -423,6 +417,7 @@ func relay(a, b net.Conn, idleTimeout time.Duration) error {
 			}
 		}
 	}
+
 	results := make(chan error, 2)
 	pump := func(src, dst net.Conn) {
 		err := copyStream(src, dst, touch)
@@ -438,6 +433,7 @@ func relay(a, b net.Conn, idleTimeout time.Duration) error {
 	}
 	go pump(a, b)
 	go pump(b, a)
+
 	var timer *time.Timer
 	var idle <-chan time.Time
 	if idleTimeout > 0 {
@@ -449,6 +445,7 @@ func relay(a, b net.Conn, idleTimeout time.Duration) error {
 			timer.Stop()
 		}
 	}()
+
 	var first error
 	for completed := 0; completed < 2; {
 		select {
@@ -477,18 +474,21 @@ func relay(a, b net.Conn, idleTimeout time.Duration) error {
 }
 
 func copyStream(src, dst net.Conn, touch func()) error {
-	buf := bytePool.Get()
-	defer bytePool.Put(buf)
+	buffer := bytePool.Get()
+	defer bytePool.Put(buffer)
+	buf := *buffer
+
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			touch()
 			_ = dst.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
-			if writeErr := WriteAll(dst, buf[:n]); writeErr != nil {
-				return writeErr
+			if err := WriteAll(dst, buf[:n]); err != nil {
+				return err
 			}
 			touch()
 		}
+
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -498,22 +498,26 @@ func copyStream(src, dst net.Conn, touch func()) error {
 	}
 }
 
-const shutdownGracePeriod = 10 * time.Second
-
-const shutdownCleanupPeriod = 5 * time.Second
+const (
+	shutdownGracePeriod   = 10 * time.Second
+	shutdownCleanupPeriod = 5 * time.Second
+)
 
 // Serve stops accepting on cancellation, drains existing sessions, then cancels
 // their work and closes remaining sockets after the grace period.
+// Serve owns the listener and closes each accepted connection when its handler returns.
 func Serve(stop context.Context, listener net.Listener, limit int, handle func(context.Context, net.Conn)) error {
 	work, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopClosing := context.AfterFunc(stop, func() { _ = listener.Close() })
 	defer stopClosing()
 	defer listener.Close()
+
 	var mu sync.Mutex
 	active := make(map[net.Conn]struct{})
 	var wg sync.WaitGroup
 	var acceptErr error
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -531,6 +535,7 @@ func Serve(stop context.Context, listener net.Listener, limit int, handle func(c
 			acceptErr = err
 			break
 		}
+
 		mu.Lock()
 		if stop.Err() != nil || len(active) >= limit {
 			mu.Unlock()
@@ -540,6 +545,7 @@ func Serve(stop context.Context, listener net.Listener, limit int, handle func(c
 		active[conn] = struct{}{}
 		wg.Add(1)
 		mu.Unlock()
+
 		go func(conn net.Conn) {
 			defer wg.Done()
 			defer func() {
@@ -551,8 +557,12 @@ func Serve(stop context.Context, listener net.Listener, limit int, handle func(c
 			handle(work, conn)
 		}(conn)
 	}
+
 	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 	timer := time.NewTimer(shutdownGracePeriod)
 	defer timer.Stop()
 	select {
@@ -560,6 +570,7 @@ func Serve(stop context.Context, listener net.Listener, limit int, handle func(c
 		return acceptErr
 	case <-timer.C:
 	}
+
 	cancel()
 	mu.Lock()
 	for conn := range active {
@@ -572,61 +583,5 @@ func Serve(stop context.Context, listener net.Listener, limit int, handle func(c
 		return acceptErr
 	case <-timer.C:
 		return errors.New("connection cleanup exceeded shutdown deadline")
-	}
-}
-
-// TransferToTCP copies a single direction with its own idle deadline.
-// Deprecated: use Relay for bidirectional tunnels with shared activity.
-func (s *Service) TransferToTCP(srcConn net.Conn, dstConn *net.TCPConn) error {
-	return copyConn(srcConn, dstConn)
-}
-
-// TransferToTLS copies a single direction with its own idle deadline.
-// Deprecated: use Relay for bidirectional tunnels with shared activity.
-func (s *Service) TransferToTLS(tcpSrc *net.TCPConn, tlsDst net.Conn) error {
-	return copyConn(tcpSrc, tlsDst)
-}
-
-// Copies data from src to dst while refreshing idle deadlines.
-func copyConn(src, dst net.Conn) error {
-	buf := bytePool.Get()
-	defer bytePool.Put(buf)
-
-	// Set initial deadline before the first read to guard against an immediate stall.
-	const idleTimeout = 5 * time.Minute
-	const deadlineInterval = 30 * time.Second
-	now := time.Now()
-	_ = src.SetReadDeadline(now.Add(idleTimeout))
-	_ = dst.SetWriteDeadline(now.Add(idleTimeout))
-	lastDeadlineUpdate := now
-
-	for {
-		// Refresh deadline less frequently to reduce syscall overhead.
-		if time.Since(lastDeadlineUpdate) > deadlineInterval {
-			now = time.Now()
-			_ = src.SetReadDeadline(now.Add(idleTimeout))
-			_ = dst.SetWriteDeadline(now.Add(idleTimeout))
-			lastDeadlineUpdate = now
-		}
-
-		n, err := src.Read(buf)
-		if n > 0 {
-			if wErr := WriteAll(dst, buf[:n]); wErr != nil {
-				return wErr
-			}
-		}
-
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
-				return nil
-			}
-			// Treat timeout as clean shutdown: idle timeout and deadline-based
-			// signaling (e.g. SetReadDeadline(time.Now())) are expected events.
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				return nil
-			}
-			return err
-		}
 	}
 }

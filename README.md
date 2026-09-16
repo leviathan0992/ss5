@@ -34,11 +34,11 @@ On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.4/ss5_0.1.4_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.5/ss5_0.1.5_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.4_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.5_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.4_Linux_x86_64
+   cd ss5_0.1.5_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:

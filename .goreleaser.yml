@@ -18,24 +18,15 @@ builds:
       - darwin
       - windows
 archives:
-  - # ID of this archive.
-    # Defaults to `default`.
-    id: my-archive
+  - id: my-archive
 
     formats:
       - tar.gz
 
-    # IDs reference which build instances should be archived in this archive.
     ids:
       - ss5-server
       - ss5-client
 
-    # Archive name template.
-    # Defaults:
-    # - if format is `tar.gz`, `tar.xz`, `gz` or `zip`:
-    #   - `{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}`
-    # - if format is `binary`:
-    #   - `{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}`
     name_template: >-
       {{- .ProjectName }}_
       {{- .Version }}_
@@ -45,25 +36,13 @@ archives:
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end -}}
 
-    # Set to true, if you want all files in the archive to be in a single directory.
-    # If set to true and you extract the archive 'goreleaser_Linux_arm64.tar.gz',
-    # you get a folder 'goreleaser_Linux_arm64'.
-    # If set to false, all files are extracted separately.
-    # You can also set it to a custom folder name (templating is supported).
-    # Default is false.
     wrap_in_directory: true
 
-    # Can be used to change the archive formats for specific GOOSs.
-    # Most common use case is to archive as zip on Windows.
-    # Default is empty.
     format_overrides:
       - goos: windows
         formats:
           - zip
 
-    # Additional files/template/globs you want to add to the archive.
-    # Defaults are any files matching `LICENSE*`, `README*`, `CHANGELOG*`,
-    #  `license*`, `readme*` and `changelog*`.
     files:
       - .ss5-client.json
       - .ss5-server.json
@@ -73,38 +52,17 @@ archives:
       - LICENSE
 
 release:
-  # Repo in which the release will be created.
-  # Default is extracted from the origin remote URL or empty if its private hosted.
   github:
     owner: Leviathan0992
     name: ss5
 
-  # If set to true, will not auto-publish the release.
-  # Default is false.
   draft: false
 
-  # If set to auto, will mark the release as not ready for production
-  # in case there is an indicator for this in the tag e.g. v1.0.0-rc1
-  # If set to true, will mark the release as not ready for production.
-  # Default is false.
   prerelease: false
 
-  # Header template for the release body.
-  # Defaults to empty.
   header: |
-    ## ss5 ({{ .Date }})
+    ## ss5 {{ .Tag }}
 
-    Welcome to this new release!
-
-  # Footer template for the release body.
-  # Defaults to empty.
-  footer: |
-    ## Thanks!
-
-    Those were the changes on {{ .Tag }}!
-
-  # You can disable this pipe in order to not upload any artifacts.
-  # Defaults to false.
   disable: false
 checksum:
   name_template: 'checksums.txt'
