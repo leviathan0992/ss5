@@ -12,6 +12,14 @@ Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands. The
 server keeps per-target UDP relay sockets within each UDP association so
 stateful UDP protocols can retain a stable upstream tuple.
 
+UDP resources are bounded internally: 128 associations, 128 targets per
+association, and 1024 target relays in total. At capacity, new work is rejected
+while existing relays remain usable. UDP payloads use native SOCKS5 UDP;
+TLS protects the control connection.
+
+On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
+10 seconds for active sessions to finish before cancelling remaining work.
+
 ```
  --------------                              --------------
 |              |                            |              |
@@ -26,11 +34,11 @@ stateful UDP protocols can retain a stable upstream tuple.
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.3/ss5_0.1.3_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.4/ss5_0.1.4_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.3_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.4_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.3_Linux_x86_64
+   cd ss5_0.1.4_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:
@@ -63,7 +71,9 @@ stateful UDP protocols can retain a stable upstream tuple.
 
    With multiple upstreams, the client automatically selects by smoothed
    connection setup time: `score = 0.75 * previous + 0.25 * sample` (milliseconds;
-   failures count as 5000). Probes use the configured credentials every 30 seconds.
+   failures count as 5000). Probes run every 30 seconds and use configured
+   upstream credentials. Without `server_auth`, they verify mTLS and SOCKS5
+   method selection; the local caller's username and password are not probed.
    A node must score at least 20% lower for two rounds before switching; connection
    failures trigger failover immediately. Existing tunnels stay on their original
    upstream. This measures connection reliability and latency, not bandwidth.
