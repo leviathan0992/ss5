@@ -237,7 +237,7 @@ func (c *client) connectServer(ctx context.Context, userConn *net.TCPConn) {
 	}
 }
 
-// acquireServer tries the selected upstream, then alternatives by health and score.
+// acquireServer tries the selected upstream, then alternatives by health and configuration order.
 // The boolean result reports whether the connection came from the pool.
 // Unknown and unavailable nodes remain eligible as a last resort.
 func (c *client) acquireServer(parent context.Context, allowPool bool) (net.Conn, bool, error) {
@@ -246,6 +246,7 @@ func (c *client) acquireServer(parent context.Context, allowPool bool) (net.Conn
 
 	order, generation := c.selector.plan()
 	stableIndex := order[0]
+	order = failoverAttempts(order)
 	if allowPool && c.pool != nil {
 		if conn := c.pool.take(stableIndex); conn != nil {
 			return conn, true, nil
@@ -277,7 +278,16 @@ func (c *client) acquireServer(parent context.Context, allowPool bool) (net.Conn
 		}
 		log.Printf("Failed to connect to server %s: %v", c.upstreams[index].addrStr, err)
 	}
-	return nil, false, fmt.Errorf("all %d upstream(s) failed; last error: %w", len(c.upstreams), err)
+	return nil, false, fmt.Errorf("all %d connection attempts failed; last error: %w", len(c.upstreams), err)
+}
+
+// failoverAttempts retries the sticky upstream three times per request before
+// trying backups. A success ends the request immediately. Attempts share the
+// existing total deadline; cancellation never starts a backup attempt.
+func failoverAttempts(order []int) []int {
+	attempts := make([]int, 0, len(order)+2)
+	attempts = append(attempts, order[0], order[0])
+	return append(attempts, order...)
 }
 
 // dialUpstream opens an upstream connection with one deadline for TCP, TLS and
@@ -739,20 +749,17 @@ func (n *nodeScore) observe(start time.Time, elapsed time.Duration, failed bool)
 // Its generation prevents an earlier dial from undoing a newer selection,
 // including switches away from and back to the same upstream.
 type upstreamSelector struct {
-	// mu protects nodes, generation, candidate and wins. Acquire it before the pool lock.
+	// mu protects nodes and generation. Acquire it before the pool lock.
 	mu         sync.Mutex
 	client     *client
 	nodes      []nodeScore
 	generation uint64
-	candidate  int
-	wins       int
 }
 
 func newUpstreamSelector(c *client) *upstreamSelector {
 	return &upstreamSelector{
-		client:    c,
-		nodes:     make([]nodeScore, len(c.upstreams)),
-		candidate: -1,
+		client: c,
+		nodes:  make([]nodeScore, len(c.upstreams)),
 	}
 }
 
@@ -788,14 +795,6 @@ func (s *upstreamSelector) plan() ([]int, uint64) {
 		if ar, br := rank(a), rank(b); ar != br {
 			return ar - br
 		}
-		if a.fresh(now) && b.fresh(now) {
-			if a.value < b.value {
-				return -1
-			}
-			if a.value > b.value {
-				return 1
-			}
-		}
 		return 0
 	})
 
@@ -818,45 +817,7 @@ func (s *upstreamSelector) connected(index int, generation uint64) {
 	}
 }
 
-// consider switches to a usable node when the current node is unavailable or stale.
-// Otherwise, a candidate must score at least 20% better for two consecutive rounds.
-func (s *upstreamSelector) consider(now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	current := int(s.client.stableIndex.Load())
-	best := current
-	for i, node := range s.nodes {
-		if node.usable(now) && (!s.nodes[best].usable(now) || node.value < s.nodes[best].value) {
-			best = i
-		}
-	}
-
-	if best == current || !s.nodes[best].usable(now) {
-		s.candidate, s.wins = -1, 0
-		return
-	}
-
-	if s.nodes[current].unavailable || !s.nodes[current].fresh(now) {
-		s.selectLocked(best, "unavailable or expired current node")
-		return
-	}
-
-	if s.nodes[best].value > 0.8*s.nodes[current].value {
-		s.candidate, s.wins = -1, 0
-		return
-	}
-
-	if s.candidate != best {
-		s.candidate, s.wins = best, 0
-	}
-	s.wins++
-	if s.wins >= 2 {
-		s.selectLocked(best, "lower score for two rounds")
-	}
-}
-
-// selectLocked updates the selected upstream and resets the candidate history.
+// selectLocked updates the selected upstream after a successful foreground failover.
 // The caller must hold s.mu.
 func (s *upstreamSelector) selectLocked(index int, reason string) {
 	previous := int(s.client.stableIndex.Load())
@@ -869,7 +830,6 @@ func (s *upstreamSelector) selectLocked(index int, reason string) {
 		s.generation++
 		log.Printf("Selected upstream %s (%s, score=%.1fms)", s.client.upstreams[index].addrStr, reason, s.nodes[index].value)
 	}
-	s.candidate, s.wins = -1, 0
 }
 
 func (s *upstreamSelector) run(ctx context.Context) {
@@ -911,7 +871,8 @@ func (s *upstreamSelector) run(ctx context.Context) {
 			}
 		}
 
-		s.consider(time.Now())
+		// Probes update fallback health only. Never change the active exit based
+		// on latency, probe failures, or recovery; foreground dials own failover.
 		select {
 		case <-ctx.Done():
 			return

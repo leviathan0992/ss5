@@ -34,11 +34,11 @@ On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.5/ss5_0.1.5_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.6/ss5_0.1.6_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.5_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.6_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.5_Linux_x86_64
+   cd ss5_0.1.6_Linux_x86_64
    ```
 
 2. Configure the ss5-client and fill in the ss5-server address:
@@ -69,14 +69,11 @@ On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
    client accepts local SOCKS5 without authentication and authenticates to
    each upstream using its configured credentials.
 
-   With multiple upstreams, the client automatically selects by smoothed
-   connection setup time: `score = 0.75 * previous + 0.25 * sample` (milliseconds;
-   failures count as 5000). Probes run every 30 seconds and use configured
-   upstream credentials. Without `server_auth`, they verify mTLS and SOCKS5
-   method selection; the local caller's username and password are not probed.
-   A node must score at least 20% lower for two rounds before switching; connection
-   failures trigger failover immediately. Existing tunnels stay on their original
-   upstream. This measures connection reliability and latency, not bandwidth.
+   With multiple upstreams, the client starts with the first configured server.
+   It tries the current server three times before falling back to another.
+   After switching, it stays on the new server without automatic failback.
+   Existing connections keep their original server; restarting resets the
+   preference to the first configured server.
 
 3. Start the ss5-client:
    ```shell
