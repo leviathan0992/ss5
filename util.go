@@ -363,12 +363,12 @@ const (
 
 // ConfigureTCPConn applies the TCP settings shared by accepted clients and targets.
 // Socket options are best effort and do not abort connection setup on failure.
+// Buffer sizes are left to the kernel: setting SO_RCVBUF on Linux disables
+// receive-window autotuning and caps throughput on high-latency paths.
 func ConfigureTCPConn(conn *net.TCPConn) {
 	_ = conn.SetKeepAlive(true)
 	_ = conn.SetKeepAlivePeriod(30 * time.Second)
 	_ = conn.SetNoDelay(true)
-	_ = conn.SetReadBuffer(128 * 1024)
-	_ = conn.SetWriteBuffer(128 * 1024)
 }
 
 // CloseConnection interrupts blocked I/O without waiting for a TLS close alert.

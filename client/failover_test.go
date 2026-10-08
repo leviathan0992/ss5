@@ -27,14 +27,14 @@ func assertPlan(t *testing.T, s *upstreamSelector, want []int) uint64 {
 	return generation
 }
 
-func TestFailoverKeepsActiveDespiteFasterBackups(t *testing.T) {
+func TestFailoverKeepsActiveWhileBackupsAreHealthy(t *testing.T) {
 	s := testSelector(3)
 	now := time.Now()
 	for round := 0; round < 4; round++ {
 		start := now.Add(time.Duration(round) * time.Millisecond)
-		s.nodes[0].observe(start, time.Second, false)
-		s.nodes[1].observe(start, time.Millisecond, false)
-		s.nodes[2].observe(start, time.Microsecond, false)
+		s.nodes[0].observe(start, false)
+		s.nodes[1].observe(start, false)
+		s.nodes[2].observe(start, false)
 		assertPlan(t, s, []int{0, 1, 2})
 	}
 }
@@ -49,7 +49,7 @@ func TestFailoverSticksAfterRecoveryAndRejectsStaleDial(t *testing.T) {
 	s.connected(0, generation)
 	assertPlan(t, s, []int{1, 2, 0})
 	for i := 0; i < 2; i++ {
-		s.nodes[0].observe(time.Now(), time.Microsecond, false)
+		s.nodes[0].observe(time.Now(), false)
 	}
 	assertPlan(t, s, []int{1, 0, 2})
 	// Only a new foreground fallback can change the sticky selection again.
@@ -64,9 +64,9 @@ func TestFailoverSticksAfterRecoveryAndRejectsStaleDial(t *testing.T) {
 func TestFailoverProbesDoNotReplaceUnavailableOrStaleActive(t *testing.T) {
 	s := testSelector(3)
 	now := time.Now()
-	s.nodes[1].observe(now, time.Millisecond, false)
-	s.nodes[0].observe(now, 0, true)
-	s.nodes[0].observe(now.Add(time.Millisecond), 0, true)
+	s.nodes[1].observe(now, false)
+	s.nodes[0].observe(now, true)
+	s.nodes[0].observe(now.Add(time.Millisecond), true)
 	assertPlan(t, s, []int{0, 1, 2})
 	s.nodes[0].updated = now.Add(-3 * time.Minute)
 	assertPlan(t, s, []int{0, 1, 2})
@@ -75,9 +75,9 @@ func TestFailoverProbesDoNotReplaceUnavailableOrStaleActive(t *testing.T) {
 func TestFailoverBackupsPreferHealthThenConfigurationOrder(t *testing.T) {
 	s := testSelector(5)
 	now := time.Now()
-	s.nodes[1].observe(now, 0, true)
-	s.nodes[3].observe(now, time.Second, false)
-	s.nodes[4].observe(now, time.Millisecond, false)
+	s.nodes[1].observe(now, true)
+	s.nodes[4].observe(now, false)
+	s.nodes[3].observe(now, false)
 	assertPlan(t, s, []int{0, 3, 4, 2, 1})
 }
 
@@ -132,5 +132,36 @@ func TestAcquireRetriesBeforeChangingExit(t *testing.T) {
 				t.Fatalf("active=%d, want %d", got, want)
 			}
 		})
+	}
+}
+
+func TestPreconnectTargetFollowsRecentDemand(t *testing.T) {
+	var stable atomic.Uint32
+	p := newPreconnectPool(context.Background(), 16, &stable, nil)
+	defer p.cancel()
+	now := time.Now()
+	p.demandStart = now
+
+	if got := p.targetLocked(now); got != 1 {
+		t.Fatalf("idle target=%d, want 1", got)
+	}
+	for i := 0; i < 5; i++ {
+		p.recordDemandLocked(now)
+	}
+	if got := p.targetLocked(now); got != 5 {
+		t.Fatalf("target=%d, want 5", got)
+	}
+	// The previous window still counts after one rotation.
+	if got := p.targetLocked(now.Add(p.ttl)); got != 5 {
+		t.Fatalf("target after one window=%d, want 5", got)
+	}
+	if got := p.targetLocked(now.Add(2 * p.ttl)); got != 1 {
+		t.Fatalf("target after two quiet windows=%d, want 1", got)
+	}
+	for i := 0; i < 40; i++ {
+		p.recordDemandLocked(now.Add(2 * p.ttl))
+	}
+	if got := p.targetLocked(now.Add(2 * p.ttl)); got != 16 {
+		t.Fatalf("burst target=%d, want size 16", got)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -33,6 +34,8 @@ type server struct {
 	serverKey string
 	clientPEM string
 	udpDNS    *dnsCache
+	// lookupIPAddr resolves UDP domain targets; nil uses net.DefaultResolver.
+	lookupIPAddr func(context.Context, string) ([]net.IPAddr, error)
 }
 
 // Config holds the server settings read from the JSON configuration file.
@@ -156,7 +159,11 @@ func (s *server) handleTLSConn(ctx context.Context, clientConn net.Conn) {
 	_ = clientConn.SetDeadline(time.Now().Add(30 * time.Second))
 	addr, cmd, err := s.ParseSOCKS5FromTLS(clientConn)
 	if err != nil {
-		log.Printf("The server failed to parse the SOCKS5 protocol: %v", err)
+		// Clients close preconnected and health-probe connections cleanly at a
+		// message boundary without sending a request; that is not an error.
+		if !errors.Is(err, io.EOF) {
+			log.Printf("The server failed to parse the SOCKS5 protocol: %v", err)
+		}
 		return
 	}
 	_ = clientConn.SetDeadline(time.Time{})
@@ -257,6 +264,13 @@ const (
 	maxUDPAssociations        = 128
 	maxRelaysPerAssociation   = 128
 	maxUDPRelays              = 1024
+	// Domain flows pinned or resolving per association; new flows beyond
+	// this are dropped like targets beyond the relay quota.
+	maxDomainFlowsPerAssociation = 4 * maxRelaysPerAssociation
+	// Bounds on datagrams held while their flow's first lookup runs.
+	maxDomainLookupsPerAssociation = 16
+	maxQueuedPerDomainLookup       = 16
+	maxQueuedDomainBytes           = 256 * 1024
 )
 
 var (
@@ -273,13 +287,23 @@ type udpAssociation struct {
 	cancel     context.CancelFunc
 	activity   idleClock
 
-	// mu protects closed, relays and pending. wg covers reserved dials and
-	// running relays so Close can wait for both kinds of work.
-	mu      sync.RWMutex
-	closed  bool
-	relays  map[udpAddrKey]*udpRelay
-	pending int
-	wg      sync.WaitGroup
+	// mu protects closed, relays, domains, lookups, queuedBytes, pending and
+	// each relay's domainFlows. wg covers reserved dials, running relays and
+	// domain lookups so Close can wait for all of them.
+	mu          sync.RWMutex
+	closed      bool
+	relays      map[udpAddrKey]*udpRelay
+	domains     map[string]*udpRelay     // Keyed by domain name and 2-byte port.
+	lookups     map[string]*domainLookup // Flows whose first lookup is running.
+	queuedBytes int                      // Payload bytes held by lookups.
+	pending     int
+	wg          sync.WaitGroup
+}
+
+// domainLookup holds a domain flow's datagrams, in arrival order, until its
+// relay exists.
+type domainLookup struct {
+	queued [][]byte
 }
 
 // udpRelay forwards datagrams between an association and one remote target.
@@ -289,6 +313,7 @@ type udpRelay struct {
 	target         *net.UDPAddr
 	responseHeader []byte
 	conn           *net.UDPConn
+	domainFlows    []string // Keys in assoc.domains that point here.
 	closeOnce      sync.Once
 	activity       idleClock
 
@@ -302,7 +327,6 @@ type udpPacketJob struct {
 	assoc *udpAssociation
 	buf   *[]byte // Ownership passes to the worker only after successful enqueue.
 	n     int
-	ip    netip.Addr // Cached domain result; invalid for IP targets and DNS misses.
 }
 
 // handleUDPAssociate binds and advertises a UDP relay, then forwards datagrams
@@ -435,23 +459,22 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 	const (
 		forwardQueueWait = 100 * time.Microsecond
 		maxConcurrentUDP = 4
-		maxConcurrentDNS = 4
+		udpQueueSize     = 8
 	)
 
-	// Keep DNS waits away from IP and cached-domain traffic without reducing
-	// the concurrency available to independent target sockets.
-	jobs := make(chan udpPacketJob, 16)
-	var forwardTimer *time.Timer
-	dnsJobs := make(chan udpPacketJob, 16)
+	// Each worker owns its queue and every flow hashes to one worker, so
+	// datagrams to the same target are forwarded in arrival order. IP flows
+	// hash by address and port, domain flows by name and port. Workers never
+	// wait for DNS: a domain flow's first lookup runs in its own goroutine
+	// and holds that flow's datagrams until the relay exists.
 	var workerWG sync.WaitGroup
-	for i := 0; i < maxConcurrentUDP; i++ {
+	jobs := make([]chan udpPacketJob, maxConcurrentUDP)
+	for i := range jobs {
+		jobs[i] = make(chan udpPacketJob, udpQueueSize)
 		workerWG.Add(1)
-		go s.udpPacketWorker(jobs, &workerWG)
+		go s.udpPacketWorker(jobs[i], &workerWG)
 	}
-	for i := 0; i < maxConcurrentDNS; i++ {
-		workerWG.Add(1)
-		go s.udpPacketWorker(dnsJobs, &workerWG)
-	}
+	var forwardTimer *time.Timer
 
 	var allowedSrc netip.AddrPort
 	var assoc *udpAssociation
@@ -459,8 +482,9 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 		if forwardTimer != nil {
 			forwardTimer.Stop()
 		}
-		close(jobs)
-		close(dnsJobs)
+		for _, queue := range jobs {
+			close(queue)
+		}
 		if assoc != nil {
 			assoc.Close()
 		}
@@ -519,14 +543,16 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 		assoc.activity.touch()
 
 		job := udpPacketJob{assoc: assoc, buf: buffer, n: n}
-		queue := jobs
-		if buf[3] == ss5.AtypDomain {
-			host := string(buf[5 : 5+int(buf[4])])
-			if ip, cached := s.udpDNS.get(host, time.Now()); cached {
-				job.ip = ip
-			} else {
-				queue = dnsJobs
-			}
+		var queue chan udpPacketJob
+		switch buf[3] {
+		case ss5.AtypIPv4:
+			key := ipv4KeyFromBytes(buf[4:8], binary.BigEndian.Uint16(buf[8:10]))
+			queue = jobs[flowHash(key[:])%maxConcurrentUDP]
+		case ss5.AtypIPv6:
+			key := ipv6KeyFromBytes(buf[4:20], binary.BigEndian.Uint16(buf[20:22]))
+			queue = jobs[flowHash(key[:])%maxConcurrentUDP]
+		case ss5.AtypDomain:
+			queue = jobs[flowHash(buf[5:7+int(buf[4])])%maxConcurrentUDP]
 		}
 
 		select {
@@ -535,26 +561,34 @@ func (s *server) receiveUDPPackets(ctx context.Context, udpConn *net.UDPConn, co
 		default:
 		}
 
-		if queue == jobs {
-			// Absorb short scheduling stalls without letting a blocked target
-			// hold up the receive loop indefinitely. DNS never waits here.
-			if forwardTimer == nil {
-				forwardTimer = time.NewTimer(forwardQueueWait)
-			} else {
-				forwardTimer.Reset(forwardQueueWait)
+		// Absorb short scheduling stalls without letting a blocked target
+		// hold up the receive loop indefinitely.
+		if forwardTimer == nil {
+			forwardTimer = time.NewTimer(forwardQueueWait)
+		} else {
+			forwardTimer.Reset(forwardQueueWait)
+		}
+		select {
+		case queue <- job:
+			if !forwardTimer.Stop() {
+				<-forwardTimer.C
 			}
-			select {
-			case queue <- job:
-				if !forwardTimer.Stop() {
-					<-forwardTimer.C
-				}
-				continue
-			case <-forwardTimer.C:
-			}
+			continue
+		case <-forwardTimer.C:
 		}
 
 		ss5.ReturnUDPBuffer(buffer)
 	}
+}
+
+// flowHash returns an FNV-1a hash used to pin a UDP flow to one worker.
+func flowHash(b []byte) uint32 {
+	h := uint32(2166136261)
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	return h
 }
 
 // udpPacketWorker processes queued packets and returns each borrowed buffer.
@@ -562,7 +596,7 @@ func (s *server) udpPacketWorker(jobs <-chan udpPacketJob, workerWG *sync.WaitGr
 	defer workerWG.Done()
 	for job := range jobs {
 		if job.assoc.ctx.Err() == nil {
-			s.handleUDPPacket(job.assoc, *job.buf, job.n, job.ip)
+			s.handleUDPPacket(job.assoc, *job.buf, job.n)
 		}
 		ss5.ReturnUDPBuffer(job.buf)
 	}
@@ -594,7 +628,7 @@ func validUDPPacket(packet []byte) bool {
 
 // handleUDPPacket resolves the target and forwards one validated UDP datagram.
 // IP targets reuse existing relays without constructing a net.UDPAddr.
-func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resolvedIP netip.Addr) {
+func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int) {
 	if assoc == nil {
 		return
 	}
@@ -615,43 +649,7 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 		headerLen = 10
 
 	case ss5.AtypDomain:
-		if n < 5 {
-			return
-		}
-		hostLen := int(buf[4])
-		if hostLen == 0 || 5+hostLen+2 > n {
-			return
-		}
-
-		port := int(binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2]))
-
-		ip := resolvedIP
-		if !ip.IsValid() {
-			host := string(buf[5 : 5+hostLen])
-			var err error
-			ip, err = s.resolveUDPHost(assoc.ctx, host)
-			if err != nil {
-				log.Printf("UDP relay DNS lookup failed for %q: %v", host, err)
-				return
-			}
-		}
-
-		var ok bool
-		key, ok = makeUDPAddrKey(ip, port)
-		if !ok {
-			log.Printf("UDP relay DNS lookup produced invalid address %v", ip)
-			return
-		}
-
-		headerLen = 5 + hostLen + 2
-		payload := buf[headerLen:n]
-		if relay := assoc.lookupRelay(key); relay != nil {
-			s.writeUDPPayload(assoc, relay, payload)
-			return
-		}
-
-		dstAddr := &net.UDPAddr{IP: ip.AsSlice(), Port: port}
-		s.forwardUDPPayload(assoc, key, dstAddr, payload)
+		s.handleUDPDomainPacket(assoc, buf[:n])
 		return
 
 	case ss5.AtypIPv6:
@@ -685,6 +683,64 @@ func (s *server) handleUDPPacket(assoc *udpAssociation, buf []byte, n int, resol
 	}
 
 	s.writeUDPPayload(assoc, relay, payload)
+}
+
+// handleUDPDomainPacket forwards one validated domain datagram. The first
+// datagram of a name and port starts a lookup in its own goroutine, so the
+// worker never waits for DNS; datagrams arriving meanwhile queue behind it.
+// Once resolved, the flow stays pinned to its relay, keeping the same target
+// tuple even if DNS changes, until the relay closes.
+func (s *server) handleUDPDomainPacket(assoc *udpAssociation, packet []byte) {
+	hostLen := int(packet[4])
+	headerLen := 5 + hostLen + 2
+	flow := packet[5:headerLen]
+	payload := packet[headerLen:]
+
+	relay, lookup, flowKey := assoc.routeDomainPacket(flow, payload)
+	if relay != nil {
+		s.writeUDPPayload(assoc, relay, payload)
+		return
+	}
+	if lookup {
+		host := string(packet[5 : 5+hostLen])
+		port := int(binary.BigEndian.Uint16(packet[5+hostLen : headerLen]))
+		go s.resolveDomainFlow(assoc, flowKey, host, port)
+	}
+}
+
+// resolveDomainFlow resolves one domain flow, creates its relay and forwards
+// the datagrams queued meanwhile in order before pinning the flow. The caller
+// has added this goroutine to assoc.wg.
+func (s *server) resolveDomainFlow(assoc *udpAssociation, flow, host string, port int) {
+	defer assoc.wg.Done()
+
+	ip, err := s.resolveUDPHost(assoc.ctx, host)
+	var relay *udpRelay
+	if err == nil {
+		key, ok := makeUDPAddrKey(ip, port)
+		if !ok {
+			err = fmt.Errorf("invalid resolved address %v", ip)
+		} else {
+			relay, err = assoc.relayForKey(key, &net.UDPAddr{IP: ip.AsSlice(), Port: port})
+		}
+	}
+	if err != nil {
+		assoc.dropDomainLookup(flow)
+		if assoc.ctx.Err() == nil && !errors.Is(err, errUDPRelayLimit) {
+			log.Printf("UDP relay setup failed for %q: %v", host, err)
+		}
+		return
+	}
+
+	for {
+		batch, done := assoc.drainOrPinDomain(flow, relay)
+		for _, payload := range batch {
+			s.writeUDPPayload(assoc, relay, payload)
+		}
+		if done {
+			return
+		}
+	}
 }
 
 // forwardUDPPayload obtains or creates a relay for dst and sends payload.
@@ -743,6 +799,8 @@ func newUDPAssociation(parent context.Context, clientConn *net.UDPConn, clientAd
 		cancel:     cancel,
 		activity:   idleClock{start: time.Now()},
 		relays:     make(map[udpAddrKey]*udpRelay),
+		domains:    make(map[string]*udpRelay),
+		lookups:    make(map[string]*domainLookup),
 	}
 }
 
@@ -752,6 +810,97 @@ func (a *udpAssociation) lookupRelay(key udpAddrKey) *udpRelay {
 	relay := a.relays[key]
 	a.mu.RUnlock()
 	return relay
+}
+
+// routeDomainPacket returns the relay pinned to flow, if any. Otherwise it
+// queues a copy of payload behind the flow's running lookup, or registers a new
+// lookup and returns lookup=true with the flow key; the caller must then start
+// resolveDomainFlow, which this call has added to a.wg. Datagrams beyond the
+// lookup quotas are dropped.
+func (a *udpAssociation) routeDomainPacket(flow, payload []byte) (relay *udpRelay, lookup bool, flowKey string) {
+	a.mu.RLock()
+	relay = a.domains[string(flow)]
+	a.mu.RUnlock()
+	if relay != nil {
+		return relay, false, ""
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil, false, ""
+	}
+	if relay = a.domains[string(flow)]; relay != nil {
+		return relay, false, ""
+	}
+	if a.queuedBytes+len(payload) > maxQueuedDomainBytes {
+		return nil, false, ""
+	}
+	if pending := a.lookups[string(flow)]; pending != nil {
+		if len(pending.queued) < maxQueuedPerDomainLookup {
+			pending.queued = append(pending.queued, append([]byte(nil), payload...))
+			a.queuedBytes += len(payload)
+		}
+		return nil, false, ""
+	}
+	if len(a.lookups) >= maxDomainLookupsPerAssociation ||
+		len(a.domains)+len(a.lookups) >= maxDomainFlowsPerAssociation {
+		return nil, false, ""
+	}
+
+	flowKey = string(flow)
+	a.lookups[flowKey] = &domainLookup{queued: [][]byte{append([]byte(nil), payload...)}}
+	a.queuedBytes += len(payload)
+	a.wg.Add(1)
+	return nil, true, flowKey
+}
+
+// drainOrPinDomain hands queued datagrams to the resolver in arrival order.
+// When none remain it pins flow to relay and reports done, so later datagrams
+// go straight to the relay only after every earlier one was written. If relay
+// has closed meanwhile, the queued datagrams are dropped and the next
+// datagram starts a new lookup.
+func (a *udpAssociation) drainOrPinDomain(flow string, relay *udpRelay) (batch [][]byte, done bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	pending := a.lookups[flow]
+	if pending == nil {
+		return nil, true
+	}
+	if a.closed || a.relays[relay.key] != relay {
+		a.releaseLookupLocked(flow, pending)
+		return nil, true
+	}
+	if len(pending.queued) > 0 {
+		batch = pending.queued
+		pending.queued = nil
+		for _, payload := range batch {
+			a.queuedBytes -= len(payload)
+		}
+		return batch, false
+	}
+
+	delete(a.lookups, flow)
+	a.domains[flow] = relay
+	relay.domainFlows = append(relay.domainFlows, flow)
+	return nil, true
+}
+
+// dropDomainLookup discards a failed lookup and the datagrams queued behind it.
+func (a *udpAssociation) dropDomainLookup(flow string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if pending := a.lookups[flow]; pending != nil {
+		a.releaseLookupLocked(flow, pending)
+	}
+}
+
+// releaseLookupLocked removes a lookup and its queued bytes. The caller must hold a.mu.
+func (a *udpAssociation) releaseLookupLocked(flow string, pending *domainLookup) {
+	for _, payload := range pending.queued {
+		a.queuedBytes -= len(payload)
+	}
+	delete(a.lookups, flow)
 }
 
 // relayForKey returns an existing relay or dials dst within the relay quotas.
@@ -848,11 +997,18 @@ func (a *udpAssociation) removeRelay(key udpAddrKey, relay *udpRelay) {
 	a.mu.Lock()
 	if current, ok := a.relays[key]; ok && current == relay {
 		delete(a.relays, key)
+		for _, flow := range relay.domainFlows {
+			if a.domains[flow] == relay {
+				delete(a.domains, flow)
+			}
+		}
+		relay.domainFlows = nil
 	}
 	a.mu.Unlock()
 }
 
-// Close cancels DNS waits, closes relays and waits for pending dials and relays.
+// Close cancels DNS waits, closes relays and waits for pending dials, relays
+// and domain lookups.
 func (a *udpAssociation) Close() {
 	if a == nil {
 		return
@@ -866,6 +1022,9 @@ func (a *udpAssociation) Close() {
 		relays = append(relays, relay)
 	}
 	a.relays = nil
+	a.domains = nil
+	a.lookups = nil
+	a.queuedBytes = 0
 	a.mu.Unlock()
 
 	for _, relay := range relays {
@@ -1063,7 +1222,11 @@ func (s *server) resolveUDPHost(parent context.Context, host string) (netip.Addr
 func (s *server) lookupUDPHost(ctx context.Context, host string, call *dnsLookupCall) {
 	defer call.cancel()
 
-	ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	lookup := s.lookupIPAddr
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
+	ipAddrs, err := lookup(ctx, host)
 	var resolvedIP netip.Addr
 	if err == nil {
 		for _, ipAddr := range ipAddrs {

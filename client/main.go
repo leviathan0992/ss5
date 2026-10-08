@@ -180,7 +180,7 @@ func (c *client) Listen() error {
 	if c.pool != nil {
 		go c.pool.run()
 		defer c.pool.close()
-		log.Printf("Preconnection pool enabled: size=%d, TTL=10s, refill stops after 10s idle", c.pool.size)
+		log.Printf("Preconnection pool enabled: max size=%d, sized by recent demand, TTL=10s, refill stops after 10s idle", c.pool.size)
 	}
 
 	if len(c.upstreams) > 1 {
@@ -254,13 +254,29 @@ func (c *client) acquireServer(parent context.Context, allowPool bool) (net.Conn
 	}
 
 	var err error
+	var previousStart time.Time
 	for position, index := range order {
+		// Space out retries of the same upstream so a fast failure, such as a
+		// refused connection during a restart, does not exhaust them at once.
+		if position > 0 && index == order[position-1] {
+			wait := time.Duration(position)*failoverRetryDelay - time.Since(previousStart)
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, false, ctx.Err()
+				case <-timer.C:
+				}
+			}
+		}
 		if ctx.Err() != nil {
 			return nil, false, ctx.Err()
 		}
 
 		var conn net.Conn
 		start := time.Now()
+		previousStart = start
 		// Reserve a share of the remaining budget for every untried node.
 		// dialUpstream still caps a single attempt at ten seconds.
 		deadline, _ := ctx.Deadline()
@@ -278,8 +294,12 @@ func (c *client) acquireServer(parent context.Context, allowPool bool) (net.Conn
 		}
 		log.Printf("Failed to connect to server %s: %v", c.upstreams[index].addrStr, err)
 	}
-	return nil, false, fmt.Errorf("all %d connection attempts failed; last error: %w", len(c.upstreams), err)
+	return nil, false, fmt.Errorf("all %d connection attempts failed; last error: %w", len(order), err)
 }
+
+// failoverRetryDelay is the minimum spacing before the first retry of the
+// sticky upstream; the second retry waits twice as long.
+const failoverRetryDelay = 250 * time.Millisecond
 
 // failoverAttempts retries the sticky upstream three times per request before
 // trying backups. A success ends the request immediately. Attempts share the
@@ -447,18 +467,23 @@ type idleConnection struct {
 type preconnectPool struct {
 	// mu protects idle connections, refill policy and dial generation.
 	// Active tunnels have been handed to callers and are not tracked here.
-	mu         sync.Mutex
-	items      []idleConnection
-	size       int
-	stable     *atomic.Uint32
-	generation uint64
-	lastUse    time.Time
-	nextDial   time.Time
-	backoff    time.Duration
-	closed     bool
-	dialCtx    context.Context
-	dialCancel context.CancelFunc
-	dial       func(context.Context, int) (net.Conn, error)
+	mu    sync.Mutex
+	items []idleConnection
+	size  int // Upper bound on idle connections.
+	// Requests seen in the current and previous TTL windows. The refill target
+	// follows recent demand so an idle pool does not churn size handshakes per TTL.
+	demand      int
+	lastDemand  int
+	demandStart time.Time
+	stable      *atomic.Uint32
+	generation  uint64
+	lastUse     time.Time
+	nextDial    time.Time
+	backoff     time.Duration
+	closed      bool
+	dialCtx     context.Context
+	dialCancel  context.CancelFunc
+	dial        func(context.Context, int) (net.Conn, error)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -481,20 +506,50 @@ func newPreconnectPool(parent context.Context, size int, stable *atomic.Uint32, 
 	ctx, cancel := context.WithCancel(parent)
 	dialCtx, dialCancel := context.WithCancel(ctx)
 	return &preconnectPool{
-		size:       size,
-		stable:     stable,
-		dial:       dial,
-		ctx:        ctx,
-		cancel:     cancel,
-		dialCtx:    dialCtx,
-		dialCancel: dialCancel,
-		wake:       make(chan struct{}, 1),
-		done:       make(chan struct{}),
-		ttl:        10 * time.Second,
-		idle:       10 * time.Second,
-		lastUse:    time.Now(),
-		backoff:    time.Second,
+		size:        size,
+		stable:      stable,
+		dial:        dial,
+		ctx:         ctx,
+		cancel:      cancel,
+		dialCtx:     dialCtx,
+		dialCancel:  dialCancel,
+		wake:        make(chan struct{}, 1),
+		done:        make(chan struct{}),
+		ttl:         10 * time.Second,
+		idle:        10 * time.Second,
+		lastUse:     time.Now(),
+		demandStart: time.Now(),
+		backoff:     time.Second,
 	}
+}
+
+// recordDemandLocked counts one request in the current TTL window.
+// The caller must hold p.mu.
+func (p *preconnectPool) recordDemandLocked(now time.Time) {
+	p.rotateDemandLocked(now)
+	p.demand++
+}
+
+// rotateDemandLocked starts a new demand window once the current one ends.
+// The caller must hold p.mu.
+func (p *preconnectPool) rotateDemandLocked(now time.Time) {
+	elapsed := now.Sub(p.demandStart)
+	if elapsed < p.ttl {
+		return
+	}
+	p.lastDemand = p.demand
+	if elapsed >= 2*p.ttl {
+		p.lastDemand = 0
+	}
+	p.demand = 0
+	p.demandStart = now
+}
+
+// targetLocked returns how many idle connections to keep: the larger request
+// count of the last two TTL windows, between 1 and size. The caller must hold p.mu.
+func (p *preconnectPool) targetLocked(now time.Time) int {
+	p.rotateDemandLocked(now)
+	return min(p.size, max(1, p.demand, p.lastDemand))
 }
 
 // take transfers an unexpired connection to the caller, or returns nil on a miss.
@@ -511,6 +566,7 @@ func (p *preconnectPool) take(index int) net.Conn {
 		p.resetDialsLocked()
 	}
 	p.lastUse = now
+	p.recordDemandLocked(now)
 	p.signal()
 
 	if int(p.stable.Load()) != index {
@@ -582,7 +638,8 @@ func (p *preconnectPool) run() {
 			return
 		}
 
-		for pending < maxConcurrentDials && len(p.items)+pending < p.size &&
+		target := p.targetLocked(now)
+		for pending < maxConcurrentDials && len(p.items)+pending < target &&
 			now.Sub(p.lastUse) < p.idle && !now.Before(p.nextDial) {
 			result := preconnectResult{born: now, generation: p.generation, index: int(p.stable.Load())}
 			// An unused pool must not keep handshakes alive past its idle window.
@@ -692,41 +749,34 @@ func (p *preconnectPool) close() {
 const (
 	probeInterval = 30 * time.Second
 	probeTimeout  = 5 * time.Second
-	scoreMaxAge   = 2 * time.Minute
+	healthMaxAge  = 2 * time.Minute
 )
 
-type nodeScore struct {
-	value       float64
+// nodeHealth tracks whether an upstream is a usable fallback. Two consecutive
+// failures mark it unavailable; two consecutive successes clear the mark.
+type nodeHealth struct {
 	updated     time.Time
 	failures    int
 	recoveries  int
 	unavailable bool
 }
 
-func (n *nodeScore) fresh(now time.Time) bool {
-	return !n.updated.IsZero() && now.Sub(n.updated) <= scoreMaxAge
+func (n *nodeHealth) fresh(now time.Time) bool {
+	return !n.updated.IsZero() && now.Sub(n.updated) <= healthMaxAge
 }
 
-func (n *nodeScore) usable(now time.Time) bool {
+func (n *nodeHealth) usable(now time.Time) bool {
 	return n.fresh(now) && !n.unavailable && n.failures == 0
 }
 
 // observe ignores probes started before the latest recorded observation.
-// Successful foreground connections do not update scores; probes and failures do.
-func (n *nodeScore) observe(start time.Time, elapsed time.Duration, failed bool) {
+// Successful foreground connections do not update health; probes and failures do.
+func (n *nodeHealth) observe(start time.Time, failed bool) {
 	if start.Before(n.updated) {
 		return
 	}
-
-	cost := float64(elapsed) / float64(time.Millisecond)
-	if failed {
-		cost = float64(probeTimeout / time.Millisecond)
-	}
 	if !n.fresh(start) {
-		n.value = cost
 		n.failures, n.recoveries = 0, 0
-	} else {
-		n.value = 0.75*n.value + 0.25*cost
 	}
 	n.updated = start
 
@@ -752,14 +802,14 @@ type upstreamSelector struct {
 	// mu protects nodes and generation. Acquire it before the pool lock.
 	mu         sync.Mutex
 	client     *client
-	nodes      []nodeScore
+	nodes      []nodeHealth
 	generation uint64
 }
 
 func newUpstreamSelector(c *client) *upstreamSelector {
 	return &upstreamSelector{
 		client: c,
-		nodes:  make([]nodeScore, len(c.upstreams)),
+		nodes:  make([]nodeHealth, len(c.upstreams)),
 	}
 }
 
@@ -781,7 +831,7 @@ func (s *upstreamSelector) plan() ([]int, uint64) {
 	}
 
 	now := time.Now()
-	rank := func(n nodeScore) int {
+	rank := func(n nodeHealth) int {
 		if n.usable(now) {
 			return 0
 		}
@@ -791,11 +841,7 @@ func (s *upstreamSelector) plan() ([]int, uint64) {
 		return 2
 	}
 	slices.SortStableFunc(order[1:], func(i, j int) int {
-		a, b := s.nodes[i], s.nodes[j]
-		if ar, br := rank(a), rank(b); ar != br {
-			return ar - br
-		}
-		return 0
+		return rank(s.nodes[i]) - rank(s.nodes[j])
 	})
 
 	// Even unknown or unavailable nodes remain a last resort for live traffic.
@@ -805,7 +851,7 @@ func (s *upstreamSelector) plan() ([]int, uint64) {
 func (s *upstreamSelector) failed(index int, start time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nodes[index].observe(start, probeTimeout, true)
+	s.nodes[index].observe(start, true)
 }
 
 // connected selects a successful fallback only if the dial plan is still current.
@@ -813,22 +859,13 @@ func (s *upstreamSelector) connected(index int, generation uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if generation == s.generation && index != int(s.client.stableIndex.Load()) {
-		s.selectLocked(index, "failover")
-	}
-}
-
-// selectLocked updates the selected upstream after a successful foreground failover.
-// The caller must hold s.mu.
-func (s *upstreamSelector) selectLocked(index int, reason string) {
-	previous := int(s.client.stableIndex.Load())
-	if previous != index {
 		if s.client.pool != nil {
 			s.client.pool.selectUpstream(index)
 		} else {
 			s.client.stableIndex.Store(uint32(index))
 		}
 		s.generation++
-		log.Printf("Selected upstream %s (%s, score=%.1fms)", s.client.upstreams[index].addrStr, reason, s.nodes[index].value)
+		log.Printf("Selected upstream %s after failover", s.client.upstreams[index].addrStr)
 	}
 }
 
@@ -849,16 +886,19 @@ func (s *upstreamSelector) run(ctx context.Context) {
 
 			start := time.Now()
 			err := probeUpstream(ctx, endpoint)
-			elapsed := time.Since(start)
 			if ctx.Err() != nil {
 				return
 			}
 
 			s.mu.Lock()
-			s.nodes[i].observe(start, elapsed, err != nil)
-			score := s.nodes[i].value
+			wasUnavailable := s.nodes[i].unavailable
+			s.nodes[i].observe(start, err != nil)
+			nowUnavailable := s.nodes[i].unavailable
 			s.mu.Unlock()
-			log.Printf("Upstream probe %s: stage=%s, score=%.1fms, success=%t", endpoint.addrStr, stage, score, err == nil)
+			// Log health transitions only; steady-state probes stay quiet.
+			if nowUnavailable != wasUnavailable {
+				log.Printf("Upstream probe %s: stage=%s, available=%t, err=%v", endpoint.addrStr, stage, !nowUnavailable, err)
+			}
 
 			if i+1 < len(s.nodes) {
 				timer := time.NewTimer(100 * time.Millisecond)

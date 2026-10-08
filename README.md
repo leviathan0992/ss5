@@ -34,34 +34,32 @@ On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
 
 1. Download the latest release package, for example:
    ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.6/ss5_0.1.6_Linux_x86_64.tar.gz
+   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.7/ss5_0.1.7_Linux_x86_64.tar.gz
    
-   tar -zxvf ss5_0.1.6_Linux_x86_64.tar.gz
+   tar -zxvf ss5_0.1.7_Linux_x86_64.tar.gz
    
-   cd ss5_0.1.6_Linux_x86_64
+   cd ss5_0.1.7_Linux_x86_64
    ```
 
-2. Configure the ss5-client and fill in the ss5-server address:
+2. Configure the ss5-client in `.ss5-client.json` and fill in the ss5-server address:
 
-   ```shell
-   # vim .ss5-client.json
-   
+   ```json
    {
-    "server_addr": [
-      "127.0.0.1:443",
-      "127.0.0.1:53"
-    ],
-    "listen_addr": "127.0.0.1:2024",
-    "client_pem": "/etc/client.pem",
-    "client_key": "/etc/client.key",
-    "server_pem": "/etc/server.pem",
-    "server_auth": {
-      "127.0.0.1:443": {
-        "username": "your-user",
-        "password": "your-password"
-      }
-    }
-    }
+     "server_addr": [
+       "127.0.0.1:58",
+       "127.0.0.1:53"
+     ],
+     "listen_addr": "127.0.0.1:2024",
+     "client_pem": "/etc/client.pem",
+     "client_key": "/etc/client.key",
+     "server_pem": "/etc/server.pem",
+     "server_auth": {
+       "127.0.0.1:58": {
+         "username": "your-user",
+         "password": "your-password"
+       }
+     }
+   }
    ```
 
    Optional `server_auth` maps upstream addresses to SOCKS5 credentials.
@@ -80,20 +78,18 @@ On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
    ./ss5-client -c .ss5-client.json
    ```
 
-4. Configure the ss5-server:
+4. Configure the ss5-server in `.ss5-server.json`:
 
-   ```shell
-   # vim .ss5-server.json
-   
+   ```json
    {
-    "listen_addr": "0.0.0.0:443",
-    "public_addr": "",
-    "server_key": "/etc/server.key",
-    "server_pem": "/etc/server.pem",
-    "client_pem": "/etc/client.pem",
-    "username": "your-user",
-    "password": "your-password"
-    }
+     "listen_addr": "0.0.0.0:58",
+     "public_addr": "",
+     "server_key": "/etc/server.key",
+     "server_pem": "/etc/server.pem",
+     "client_pem": "/etc/client.pem",
+     "username": "your-user",
+     "password": "your-password"
+   }
    ```
 
    Set both `username` and `password` to require matching client credentials
