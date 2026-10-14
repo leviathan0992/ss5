@@ -92,7 +92,7 @@ func NewClient(listen string, serverAddrs []string, clientPEM, clientKey, server
 
 	// Each endpoint gets its own ServerName while sharing the session cache.
 	baseTLS := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS13,
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            serverCertPool,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),

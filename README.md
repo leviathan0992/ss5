@@ -1,111 +1,87 @@
-# ss5
+# SS5
 
-A Golang Implementation of SOCKS5 over TLS.
+A SOCKS5 proxy with mutually authenticated TLS for client–server connections.
 
-This project provides a Golang implementation of a SOCKS5 over TLS proxy
-system, including client and server components. The client runs locally to
-convert regular SOCKS5 requests into encrypted TLS requests and forwards them
-to the remote server. The server receives and decrypts these requests for
-further processing.
+- **Transport:** TLS 1.3 for TCP traffic and the SOCKS5 control connection.
+- **Authentication:** mutual TLS, with optional SOCKS5 username and password authentication.
+- **Proxy commands:** TCP CONNECT and UDP ASSOCIATE.
 
-Currently, the ss5 supports the TCP/CONNECT and UDP/ASSOCIATE commands. The
-server keeps per-target UDP relay sockets within each UDP association so
-stateful UDP protocols can retain a stable upstream tuple.
+## Build
 
-UDP resources are bounded internally: 128 associations, 128 targets per
-association, and 1024 target relays in total. At capacity, new work is rejected
-while existing relays remain usable. UDP payloads use native SOCKS5 UDP;
-TLS protects the control connection.
+Use a Go toolchain compatible with `go.mod`:
 
-On SIGINT/SIGTERM, both binaries stop accepting new connections and allow
-10 seconds for active sessions to finish before cancelling remaining work.
-
-```
- --------------                              --------------
-|              |                            |              |
-|              |   SOCKS5 OVER TLS (TCP)    |              |
-|  ss5-client  |  ----------------------->  |  ss5-server  |
-|              |                            |              |
-|              |                            |              |
- --------------                              --------------
+```sh
+go build -o ss5-client ./client
+go build -o ss5-server ./server
 ```
 
-## Usage:
+Prebuilt binaries are available on the [releases page](https://github.com/leviathan0992/ss5/releases).
 
-1. Download the latest release package, for example:
-   ``` shell
-   wget https://github.com/leviathan0992/ss5/releases/download/v0.1.7/ss5_0.1.7_Linux_x86_64.tar.gz
-   
-   tar -zxvf ss5_0.1.7_Linux_x86_64.tar.gz
-   
-   cd ss5_0.1.7_Linux_x86_64
-   ```
+## Configuration
 
-2. Configure the ss5-client in `.ss5-client.json` and fill in the ss5-server address:
+### Server
 
-   ```json
-   {
-     "server_addr": [
-       "127.0.0.1:58",
-       "127.0.0.1:53"
-     ],
-     "listen_addr": "127.0.0.1:2024",
-     "client_pem": "/etc/client.pem",
-     "client_key": "/etc/client.key",
-     "server_pem": "/etc/server.pem",
-     "server_auth": {
-       "127.0.0.1:58": {
-         "username": "your-user",
-         "password": "your-password"
-       }
-     }
-   }
-   ```
+Save as `.ss5-server.json`:
 
-   Optional `server_auth` maps upstream addresses to SOCKS5 credentials.
-   Each address must match an entry in `server_addr`. When configured, the
-   client accepts local SOCKS5 without authentication and authenticates to
-   each upstream using its configured credentials.
+```json
+{
+  "listen_addr": "0.0.0.0:58",
+  "public_addr": "",
+  "server_key": "/etc/ss5/server.key",
+  "server_pem": "/etc/ss5/server.pem",
+  "client_pem": "/etc/ss5/client-ca.pem",
+  "username": "your-user",
+  "password": "your-password"
+}
+```
 
-   With multiple upstreams, the client starts with the first configured server.
-   It tries the current server three times before falling back to another.
-   After switching, it stays on the new server without automatic failback.
-   Existing connections keep their original server; restarting resets the
-   preference to the first configured server.
+- `server_pem` and `server_key` contain the server certificate chain and matching private key.
+- `client_pem` contains the CA certificates trusted to authenticate clients.
+- Set both `username` and `password` to require SOCKS5 credentials in addition to mTLS; omit both for certificate-only authentication.
+- For UDP behind NAT or a cloud public-IP mapping, set `public_addr` to the IP or hostname reachable by clients.
 
-3. Start the ss5-client:
-   ```shell
-   ./ss5-client -c .ss5-client.json
-   ```
+```sh
+./ss5-server -c .ss5-server.json
+```
 
-4. Configure the ss5-server in `.ss5-server.json`:
+### Client
 
-   ```json
-   {
-     "listen_addr": "0.0.0.0:58",
-     "public_addr": "",
-     "server_key": "/etc/server.key",
-     "server_pem": "/etc/server.pem",
-     "client_pem": "/etc/client.pem",
-     "username": "your-user",
-     "password": "your-password"
-   }
-   ```
+Save as `.ss5-client.json`:
 
-   Set both `username` and `password` to require matching client credentials
-   in addition to mTLS. Omit both for certificate-only authentication.
+```json
+{
+  "server_addr": ["127.0.0.1:58"],
+  "listen_addr": "127.0.0.1:2024",
+  "client_pem": "/etc/ss5/client.pem",
+  "client_key": "/etc/ss5/client.key",
+  "server_pem": "/etc/ss5/server-ca.pem",
+  "server_auth": {
+    "127.0.0.1:58": {
+      "username": "your-user",
+      "password": "your-password"
+    }
+  }
+}
+```
 
-   `public_addr` is optional, but it is recommended when the server runs
-   behind NAT, an Elastic IP, a cloud private network, or any other topology
-   where the server's local interface address is not directly reachable by the
-   client. In those environments, set it to the public IP or hostname clients
-   actually use to reach the server.
+- Replace the example loopback address with the remote server address. Its IP or hostname must match the server certificate SAN.
+- `client_pem` and `client_key` contain the client certificate chain and matching private key; `server_pem` contains the trusted server CA certificates.
+- Optional `server_auth` keys must exactly match entries in `server_addr`. When configured, the client accepts local SOCKS5 without authentication and supplies the configured credentials to the upstream server.
 
-5. Start the ss5-server:
-   ```shell
-   ./ss5-server -c .ss5-server.json
-   ```
+```sh
+./ss5-client -c .ss5-client.json
+```
 
-## License:
+Applications connect to the local SOCKS5 listener at `127.0.0.1:2024`.
 
-Apache-2.0 license
+## Protocol and operational limits
+
+- **TLS:** both components require TLS 1.3. The client validates the server certificate chain and endpoint identity; the server validates client certificates against its configured CA trust. Certificate fingerprint allowlists are not supported.
+- **UDP:** datagrams use native SOCKS5 UDP and are **not encrypted by TLS**. TLS protects the control connection. Per-target relay sockets preserve stable UDP source tuples within an association.
+- **Capacity:** UDP resources are limited to 128 associations, 128 targets per association, and 1,024 target relays in total. New work is rejected at capacity while existing relays remain usable.
+- **Failover:** the client starts with the first upstream and switches after three connection failures. It stays on the selected upstream until another switch or a restart; existing connections retain their original upstream.
+- **Shutdown:** SIGINT or SIGTERM stops new connections and allows active sessions up to 10 seconds to finish before cancellation.
+
+## License
+
+[Apache-2.0](LICENSE)

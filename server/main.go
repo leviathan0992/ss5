@@ -122,25 +122,9 @@ func (s *server) ListenTLS() error {
 		log.Printf("The server's public UDP address is %s.", s.publicIP.String())
 	}
 
-	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKey)
+	serverTLSConfig, err := s.tlsConfig()
 	if err != nil {
-		return fmt.Errorf("load server certificate and key: %w", err)
-	}
-
-	certBytes, err := os.ReadFile(s.clientPEM)
-	if err != nil {
-		return fmt.Errorf("read client CA %q: %w", s.clientPEM, err)
-	}
-	clientCertPool := x509.NewCertPool()
-	if !clientCertPool.AppendCertsFromPEM(certBytes) {
-		return errors.New("failed to parse PEM-encoded client certificates")
-	}
-
-	serverTLSConfig := &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    clientCertPool,
+		return err
 	}
 
 	listener, err := tls.Listen("tcp", s.ListenAddr.String(), serverTLSConfig)
@@ -152,6 +136,32 @@ func (s *server) ListenTLS() error {
 	stop, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 	return ss5.Serve(stop, listener, 4096, s.handleTLSConn)
+}
+
+// tlsConfig loads the server identity and client trust with a TLS 1.3 minimum.
+func (s *server) tlsConfig() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKey)
+	if err != nil {
+		return nil, fmt.Errorf("load server certificate and key: %w", err)
+	}
+
+	certBytes, err := os.ReadFile(s.clientPEM)
+	if err != nil {
+		return nil, fmt.Errorf("read client CA %q: %w", s.clientPEM, err)
+	}
+	clientCertPool := x509.NewCertPool()
+	if !clientCertPool.AppendCertsFromPEM(certBytes) {
+		return nil, errors.New("failed to parse PEM-encoded client certificates")
+	}
+
+	serverTLSConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCertPool,
+	}
+
+	return serverTLSConfig, nil
 }
 
 // handleTLSConn authenticates a client and dispatches its SOCKS5 request.

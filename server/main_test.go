@@ -7,13 +7,17 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -312,5 +316,122 @@ func TestUDPSlowLookupDoesNotBlockPinnedDomainFlow(t *testing.T) {
 	}
 	if received == 0 {
 		t.Fatal("pinned flow blocked behind slow lookup")
+	}
+}
+
+// testSignedIdentity keeps each peer identity separate from its CA and other peers.
+func testSignedIdentity(t *testing.T, name string, purpose x509.ExtKeyUsage) (tls.Certificate, *x509.Certificate) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: name + " CA"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), BasicConstraintsValid: true, IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: name}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{purpose}}
+	if purpose == x509.ExtKeyUsageServerAuth {
+		leaf.IPAddresses = []net.IP{net.IPv4(127, 0, 0, 1)}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, leaf, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der, caDER}, PrivateKey: key}, ca
+}
+
+// Exercise the production TLS policy with real handshakes and client trust.
+func TestTLSMinimumAndClientAuthentication(t *testing.T) {
+	cert, serverCA := testSignedIdentity(t, "server", x509.ExtKeyUsageServerAuth)
+	clientIdentity, clientCA := testSignedIdentity(t, "client", x509.ExtKeyUsageClientAuth)
+	untrusted, _ := testSignedIdentity(t, "untrusted", x509.ExtKeyUsageClientAuth)
+	directory := t.TempDir()
+	certPath, keyPath := filepath.Join(directory, "identity.pem"), filepath.Join(directory, "identity.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	clientCAPath := filepath.Join(directory, "client-ca.pem")
+	if err := os.WriteFile(clientCAPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCA.Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	service := &server{serverPEM: certPath, serverKey: keyPath, clientPEM: clientCAPath}
+	config, err := service.tlsConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(serverCA)
+	for _, tc := range []struct {
+		name     string
+		version  uint16
+		identity *tls.Certificate
+		accepted bool
+	}{
+		{"TLS12Rejected", tls.VersionTLS12, &clientIdentity, false},
+		{"TLS13Accepted", tls.VersionTLS13, &clientIdentity, true},
+		{"MissingClientCertificateRejected", tls.VersionTLS13, nil, false},
+		{"UntrustedClientCertificateRejected", tls.VersionTLS13, &untrusted, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := tls.Listen("tcp", "127.0.0.1:0", config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			result := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					result <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				result <- conn.(*tls.Conn).Handshake()
+			}()
+			clientConfig := &tls.Config{RootCAs: roots, MinVersion: tc.version, MaxVersion: tc.version}
+			if tc.identity != nil {
+				// Send the chosen identity even when its issuer is not requested, so
+				// the untrusted case exercises verification rather than missing identity.
+				clientConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return tc.identity, nil }
+			}
+			conn, clientErr := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", listener.Addr().String(), clientConfig)
+			if conn != nil {
+				defer conn.Close()
+			}
+			select {
+			case serverErr := <-result:
+				if tc.accepted {
+					if clientErr != nil || serverErr != nil {
+						t.Fatalf("mutual TLS failed: client=%v server=%v", clientErr, serverErr)
+					}
+					if got := conn.ConnectionState().Version; got != tls.VersionTLS13 {
+						t.Fatalf("version=%x, want TLS 1.3", got)
+					}
+				} else if serverErr == nil {
+					t.Fatal("server accepted a prohibited peer")
+				}
+			case <-time.After(6 * time.Second):
+				t.Fatal("server handshake did not finish")
+			}
+		})
 	}
 }

@@ -61,7 +61,7 @@ release:
   prerelease: false
 
   header: |
-    ## ss5 {{ .Tag }}
+    ## SS5 {{ .Tag }}
 
   disable: false
 checksum:
