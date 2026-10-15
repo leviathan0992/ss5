@@ -6,20 +6,18 @@ A SOCKS5 proxy with mutually authenticated TLS for client–server connections.
 - **Authentication:** mutual TLS, with optional SOCKS5 username and password authentication.
 - **Proxy commands:** TCP CONNECT and UDP ASSOCIATE.
 
-## Build
+## Quick start
 
-Use a Go toolchain compatible with `go.mod`:
+### 1. Get the binaries
+
+Download the binaries for your platform from the [releases page](https://github.com/leviathan0992/ss5/releases), or build from source with a Go toolchain compatible with `go.mod`:
 
 ```sh
 go build -o ss5-client ./client
 go build -o ss5-server ./server
 ```
 
-Prebuilt binaries are available on the [releases page](https://github.com/leviathan0992/ss5/releases).
-
-## Configuration
-
-### Server
+### 2. Configure and start the server
 
 Save as `.ss5-server.json`:
 
@@ -44,7 +42,7 @@ Save as `.ss5-server.json`:
 ./ss5-server -c .ss5-server.json
 ```
 
-### Client
+### 3. Configure and start the client
 
 Save as `.ss5-client.json`:
 
